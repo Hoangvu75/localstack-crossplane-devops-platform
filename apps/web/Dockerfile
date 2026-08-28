@@ -23,13 +23,13 @@ COPY package*.json ./
 # --no-audit --no-fund: the audit pass POSTs the whole dependency tree to the registry
 # and, on a Next.js tree inside DinD, was a large part of a 47-MINUTE npm ci.
 #
-# The `node -e require.resolve` is not paranoia. npm 10.8.2 hit its own bug here:
+# The `test -d` is not paranoia. npm 10.8.2 hit its own bug here:
 #     npm error Exit handler never called!
 # and then EXITED 0, leaving node_modules empty. Docker happily continued, and the
 # failure surfaced two steps later as `sh: next: not found` with exit 127 -- pointing at
 # the build script instead of the install. This makes the install fail where it broke.
 RUN npm ci --legacy-peer-deps --no-audit --no-fund \
- && node -e "require.resolve(next/package.json)"
+ && test -d node_modules/next
 
 COPY . .
 
