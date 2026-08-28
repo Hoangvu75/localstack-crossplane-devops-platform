@@ -30,11 +30,34 @@ kind: Kustomization
 #
 # The upstream manifests already declare correct namespaces, and every local file below
 # sets `namespace: tekton-pipelines` explicitly on its own resources.
+# ── Why these versions and not the ones this repo started with ──────────────
+# It was pipeline v0.56.0 / triggers v0.27.0 / dashboard v0.45.0, and none of them can be
+# installed any more. Those releases publish their images to gcr.io, and Google has
+# migrated gcr.io onto Artifact Registry, where the tekton-releases project no longer
+# serves anonymous pulls:
+#
+#     Unauthenticated requests do not have permission
+#     artifactregistry.repositories.downloadArtifacts on resource
+#     projects/tekton-releases/locations/us/repositories/gcr.io
+#
+# Inside the cluster that surfaced only as a 403 on the token endpoint, which looks like
+# a LocalStack DNS problem and is not one -- `docker pull` of the same image from the
+# Docker host, nowhere near LocalStack, fails identically.
+#
+# Tekton has since moved to ghcr.io, which is already on the
+# DNS_NAME_PATTERNS_TO_RESOLVE_UPSTREAM allowlist in docker-compose.yml. All three
+# components below were checked with `docker manifest inspect` before being pinned.
+#
+# tekton.dev/v1beta1 is still served for Task/Pipeline/TaskRun/PipelineRun in pipeline
+# v1.x, so nothing under ci/ had to change. Prefer tekton.dev/v1 for anything new.
+#
+# The dashboard number is not a typo: v0.63.1 is what the release bucket actually serves
+# as latest, even though GitHub tags v0.71.0.
 resources:
-  - pipeline-v0.56.0.yaml
-  - triggers-v0.27.0.yaml
-  - triggers-interceptors-v0.27.0.yaml
-  - dashboard-v0.45.0.yaml
+  - pipeline-v1.6.0.yaml
+  - triggers-v0.34.0.yaml
+  - triggers-interceptors-v0.34.0.yaml
+  - dashboard-v0.63.1.yaml
   - rbac.yaml
   - ingress.yaml
   - ci/task-git-clone.yaml
