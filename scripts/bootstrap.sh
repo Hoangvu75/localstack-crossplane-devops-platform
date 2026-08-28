@@ -116,6 +116,46 @@ if ! kubectl wait --for=condition=Ready nodes --all --timeout=300s >/dev/null; t
 fi
 echo "    nodes ready"
 
+# ── Without this, nothing the lab installs can ever be scheduled ────────────
+# LocalStack starts a single-node k3d cluster and leaves the k3s server carrying
+#     node-role.kubernetes.io/control-plane=true:NoSchedule
+# There is no second node, because nothing here calls `aws eks create-nodegroup`. So
+# every workload without a matching toleration is unschedulable forever. kube-system
+# pods (CoreDNS, metrics-server, local-path-provisioner) tolerate it and run, which
+# makes the cluster look perfectly healthy.
+#
+# The symptom is two layers away from the cause. `helm --wait` sits until its timeout
+# and then reports:
+#     Error: context deadline exceeded
+# naming neither the taint nor the pods. Only `kubectl -n crossplane-system describe
+# pod` says what actually happened:
+#     0/1 nodes are available: 1 node(s) had untolerated taint
+#     {node-role.kubernetes.io/control-plane: true}
+#
+# The sibling learn-opensible lab never hit this: it created an EKS nodegroup, so LocalStack
+# added untainted k3d agent containers and workloads landed there.
+#
+# Removing the taint is the right trade here rather than adding a nodegroup: a nodegroup
+# means two more containers on a box that already has to run SigNoz/ClickHouse, and
+# scheduling on the control plane is what every single-node local cluster does (kind,
+# minikube and plain k3d all do it by default). If you want the more AWS-shaped topology,
+# call `aws eks create-nodegroup` here instead and drop this.
+#
+# The trailing "-" is kubectl taint remove syntax. It errors when the taint is absent, so
+# this has to swallow failure to stay idempotent across re-runs.
+echo "    removing the control-plane NoSchedule taint (single-node cluster)"
+kubectl taint nodes --all node-role.kubernetes.io/control-plane- >/dev/null 2>&1 || true
+# Clusters older than k8s 1.24 spell it "master". Harmless when absent.
+kubectl taint nodes --all node-role.kubernetes.io/master- >/dev/null 2>&1 || true
+
+# Assert, because a silent failure here costs five minutes at the next helm --wait.
+REMAINING=$(kubectl get nodes -o jsonpath='{.items[*].spec.taints[*].key}' 2>/dev/null | tr ' ' '\n' | grep -c "node-role.kubernetes.io" || true)
+if [ "${REMAINING:-0}" -gt 0 ]; then
+  echo "ERROR: a node-role NoSchedule taint survived. Nothing will schedule." >&2
+  echo "       kubectl get nodes -o jsonpath='{.items[*].spec.taints}'" >&2
+  exit 1
+fi
+
 # ── 2. Crossplane ────────────────────────────────────────────────────────────
 echo ""
 echo ">>> [2/6] Crossplane ${CROSSPLANE_VERSION}"

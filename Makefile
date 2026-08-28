@@ -4,6 +4,25 @@
 # `status` and `run-ci` used to be shell scripts. They are plain kubectl sequences with no
 # logic worth putting in a file, and keeping them here makes the whole surface of the
 # project visible in one screen.
+# ── Why these are exported ───────────────────────────────────────────────────
+# aws eks update-kubeconfig writes an exec credential plugin:
+#     command: aws
+#     args:    [--region, us-east-1, eks, get-token, --cluster-name, ...]
+#     env:     null
+# env: null means the plugin inherits the shell environment, so EVERY kubectl call
+# needs AWS credentials present or it fails with something that names neither kubectl
+# nor the cluster:
+#     Unable to locate credentials. You can configure credentials by running "aws configure".
+#     Unable to connect to the server: getting credentials: exec: executable aws failed
+#
+# The scripts get these from .env via scripts/lib.sh. make runs each recipe in its own
+# shell and does not read .env, so status and run-ci need them here.
+#
+# ?= so a real AWS profile in the environment still wins.
+export AWS_ACCESS_KEY_ID ?= mock_access_key
+export AWS_SECRET_ACCESS_KEY ?= mock_secret_key
+export AWS_DEFAULT_REGION ?= us-east-1
+
 .PHONY: all up secrets bootstrap status run-ci destroy purge
 
 # secrets before bootstrap: step 5 of the bootstrap reads the token back out of Secrets
