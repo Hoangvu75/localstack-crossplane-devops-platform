@@ -34,25 +34,39 @@ data:
       echo "         in gitops/infrastructure/provider/provider-config.yaml."
     fi
 
-    # ── 1. ALB target group membership ──────────────────────────────────────
+    # ── 1. ALB target group membership, one per console ─────────────────────
+    # Three load balancers, three NodePorts. Each pair is a CONTRACT between a target
+    # group in gitops/infrastructure/loadbalancer/ and a Service nodePort:
+    #
+    #   -tg-ip     :30080  ingress-nginx, the public application
+    #   -argocd-tg :30081  argocd-server-nodeport
+    #   -signoz-tg :30083  signoz-nodeport
+    #
+    # k3d gives the node a new container IP on every cluster recreation, which is why
+    # none of this can be written down as a manifest.
     NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || echo "")
-    TG_ARN=$(aws elbv2 describe-target-groups --names "${TG_NAME}" --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null || echo "")
-
-    if [ -z "${TG_ARN}" ] || [ "${TG_ARN}" = "None" ]; then
-      echo "target group ${TG_NAME} does not exist yet, Crossplane still reconciling"
-    elif [ -z "${NODE_IP}" ]; then
-      echo "WARNING: could not read the node InternalIP"
+    if [ -z "${NODE_IP}" ]; then
+      echo "WARNING: could not read the node InternalIP, skipping target registration"
     else
-      CURRENT=$(aws elbv2 describe-target-health --target-group-arn "${TG_ARN}" --query 'TargetHealthDescriptions[].Target.Id' --output text 2>/dev/null || echo "")
-      # Compared before writing so a converged cluster makes no write calls. Registering
-      # an already-registered target is harmless, but it makes the log useless for
-      # spotting the moment a node IP actually changed.
-      if echo " ${CURRENT} " | grep -Fq " ${NODE_IP} "; then
-        echo "target ${NODE_IP}:30080 already registered"
-      else
-        aws elbv2 register-targets --target-group-arn "${TG_ARN}" --targets "Id=${NODE_IP},Port=30080"
-        echo "registered ${NODE_IP}:30080 (previous: ${CURRENT:-none})"
-      fi
+      for PAIR in "${PROJECT}-tg-ip:30080" "${PROJECT}-argocd-tg:30081" "${PROJECT}-signoz-tg:30083"; do
+        TG_N="${PAIR%%:*}"
+        TG_P="${PAIR##*:}"
+        TG_ARN=$(aws elbv2 describe-target-groups --names "${TG_N}" --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null || echo "")
+        if [ -z "${TG_ARN}" ] || [ "${TG_ARN}" = "None" ]; then
+          echo "target group ${TG_N} does not exist yet, Crossplane still reconciling"
+          continue
+        fi
+        CURRENT=$(aws elbv2 describe-target-health --target-group-arn "${TG_ARN}" --query 'TargetHealthDescriptions[].Target.Id' --output text 2>/dev/null || echo "")
+        # Compared before writing so a converged cluster makes no write calls.
+        # Re-registering is harmless, but it makes the log useless for spotting the
+        # moment a node IP actually changed.
+        if echo " ${CURRENT} " | grep -Fq " ${NODE_IP} "; then
+          echo "${TG_N}: ${NODE_IP}:${TG_P} already registered"
+        else
+          aws elbv2 register-targets --target-group-arn "${TG_ARN}" --targets "Id=${NODE_IP},Port=${TG_P}"
+          echo "${TG_N}: registered ${NODE_IP}:${TG_P} (previous: ${CURRENT:-none})"
+        fi
+      done
     fi
 
     # ── 2. CloudFront origin and Route53 alias ──────────────────────────────
@@ -97,7 +111,15 @@ data:
     # Printed every loop so `make status`, which tails this log, always has the current
     # entry URLs without querying anything itself.
     CF_DOMAIN=$(kubectl get distribution.cloudfront.aws.upbound.io "${CF_MR}" -o jsonpath='{.status.atProvider.domainName}' 2>/dev/null || echo "")
-    echo "ENDPOINT ALB        http://${ALB_DNS}:4566/"
+    echo "ENDPOINT App        http://${ALB_DNS}:4566/"
+    for PAIR in "argocd-alb:ArgoCD" "signoz-alb:SigNoz"; do
+      LB_N="${PROJECT}-${PAIR%%:*}"
+      LB_LABEL="${PAIR##*:}"
+      D=$(aws elbv2 describe-load-balancers --names "${LB_N}" --query 'LoadBalancers[0].DNSName' --output text 2>/dev/null || echo "")
+      if [ -n "${D}" ] && [ "${D}" != "None" ]; then
+        echo "ENDPOINT ${LB_LABEL}     http://${D}:4566/"
+      fi
+    done
     if [ -n "${CF_DOMAIN}" ]; then
       echo "ENDPOINT CloudFront http://${CF_DOMAIN}:4566/"
     fi

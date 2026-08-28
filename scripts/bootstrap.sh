@@ -269,6 +269,30 @@ kubectl apply -n argocd -f gitops/bootstrap/argocd/install-v2.13.2.yaml >/dev/nu
 kubectl -n argocd wait --for=condition=Available deployment/argocd-server --timeout=300s >/dev/null
 echo "    server available"
 
+# ── The two files that used to sit here doing nothing ───────────────────────
+# gitops/bootstrap/argocd/server-params-cm.yaml and nodeport-svc.yaml were copied over
+# from the sibling lab but never applied by anything, so the ArgoCD UI had no route in
+# at all and port-forward was the only way to reach it.
+#
+# They have to be applied in this order and AFTER the install, because the install
+# manifest ships its own argocd-cmd-params-cm and would overwrite the override.
+#
+#   server-params-cm  sets server.insecure=true, which is what makes argocd-server
+#                     listen plain HTTP on 8080. Without it the NodePort below targets a
+#                     port that speaks TLS, and the ALB health check gets a protocol
+#                     error rather than a 200.
+#   nodeport-svc      exposes that port as NodePort 30081, which is a contract with the
+#                     target group in gitops/infrastructure/loadbalancer/alb-argocd.yaml.
+echo "    applying server.insecure and the NodePort service"
+kubectl apply -f gitops/bootstrap/argocd/server-params-cm.yaml >/dev/null
+kubectl apply -f gitops/bootstrap/argocd/nodeport-svc.yaml >/dev/null
+
+# argocd-server reads cmd-params only at startup, so the ConfigMap alone changes nothing
+# until the pod is replaced.
+kubectl -n argocd rollout restart deployment/argocd-server >/dev/null
+kubectl -n argocd rollout status deployment/argocd-server --timeout=180s >/dev/null
+echo "    server restarted with plain HTTP on NodePort 30081"
+
 # ── 5. The credential that connects CI to CD ─────────────────────────────────
 echo ""
 echo ">>> [5/6] git-credentials Secret"

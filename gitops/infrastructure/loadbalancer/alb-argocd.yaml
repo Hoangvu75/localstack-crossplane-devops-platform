@@ -1,0 +1,89 @@
+# Dedicated ALB for the ArgoCD UI.
+#
+# ── Why a second load balancer and not a path on the app one ────────────────
+# The app ALB forwards to ingress-nginx on NodePort 30080, where routing is decided by
+# the host-less Ingress in gitops/workloads/_shared/. ArgoCD serves its UI from / and
+# would need a base-href rewrite to live under a subpath there, and it would then be
+# sharing an ingress with the public application. A separate ALB pointed straight at the
+# argocd-server NodePort keeps the two apart, which is also how the sibling
+# learn-opensible lab does it (iac/alb-argocd.tf).
+#
+# `internal: false` only because LocalStack has no VPN or bastion. On real AWS this
+# should be internal, reachable over a VPN, and never internet-facing — see README §7.
+apiVersion: elbv2.aws.upbound.io/v1beta1
+kind: LB
+metadata:
+  name: learn-crossplane-argocd-alb
+  labels:
+    component: alb-argocd
+spec:
+  forProvider:
+    enableDeletionProtection: false
+    internal: false
+    loadBalancerType: application
+    name: learn-crossplane-argocd-alb
+    region: us-east-1
+    securityGroupSelector:
+      matchLabels:
+        role: alb-sg
+    subnetRefs:
+      - name: learn-crossplane-public-a
+      - name: learn-crossplane-public-b
+    tags:
+      Name: learn-crossplane-argocd-alb
+      Environment: dev
+      Component: gitops
+---
+apiVersion: elbv2.aws.upbound.io/v1beta1
+kind: LBTargetGroup
+metadata:
+  name: learn-crossplane-argocd-tg
+  labels:
+    component: alb-argocd
+spec:
+  forProvider:
+    # 30081 is a CONTRACT with the nodePort in gitops/bootstrap/argocd/nodeport-svc.yaml.
+    # Changing one without the other produces an ALB that health-checks a closed port and
+    # returns 503 with nothing wrong anywhere else.
+    healthCheck:
+      - healthyThreshold: 2
+        interval: 30
+        matcher: "200"
+        path: /healthz
+        protocol: HTTP
+        timeout: 5
+        unhealthyThreshold: 3
+    name: learn-crossplane-argocd-tg
+    port: 30081
+    protocol: HTTP
+    region: us-east-1
+    # ip, not instance: on LocalStack the "instance" is a k3d container, and the
+    # localstack-wiring CronJob registers its address directly.
+    targetType: ip
+    vpcIdSelector:
+      matchLabels:
+        environment: dev
+    tags:
+      Name: learn-crossplane-argocd-tg
+      Environment: dev
+---
+apiVersion: elbv2.aws.upbound.io/v1beta1
+kind: LBListener
+metadata:
+  name: learn-crossplane-argocd-listener
+spec:
+  forProvider:
+    defaultAction:
+      - targetGroupArnSelector:
+          matchLabels:
+            component: alb-argocd
+        type: forward
+    loadBalancerArnSelector:
+      matchLabels:
+        component: alb-argocd
+    port: 80
+    protocol: HTTP
+    region: us-east-1
+    tags:
+      Name: learn-crossplane-argocd-listener
+      Environment: dev

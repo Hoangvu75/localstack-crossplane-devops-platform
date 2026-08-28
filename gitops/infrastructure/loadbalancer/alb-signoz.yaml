@@ -1,0 +1,80 @@
+# Dedicated ALB for the SigNoz UI, same reasoning as alb-argocd.yaml: an observability
+# console should not share an ingress with the public application, and SigNoz serves from
+# / as well. Mirrors iac/alb-signoz.tf in the sibling learn-opensible lab.
+apiVersion: elbv2.aws.upbound.io/v1beta1
+kind: LB
+metadata:
+  name: learn-crossplane-signoz-alb
+  labels:
+    component: alb-signoz
+spec:
+  forProvider:
+    enableDeletionProtection: false
+    internal: false
+    loadBalancerType: application
+    name: learn-crossplane-signoz-alb
+    region: us-east-1
+    securityGroupSelector:
+      matchLabels:
+        role: alb-sg
+    subnetRefs:
+      - name: learn-crossplane-public-a
+      - name: learn-crossplane-public-b
+    tags:
+      Name: learn-crossplane-signoz-alb
+      Environment: dev
+      Component: observability
+---
+apiVersion: elbv2.aws.upbound.io/v1beta1
+kind: LBTargetGroup
+metadata:
+  name: learn-crossplane-signoz-tg
+  labels:
+    component: alb-signoz
+spec:
+  forProvider:
+    # 30083 is a CONTRACT with the nodePort in gitops/platform/signoz/nodeport-svc.yaml.
+    #
+    # The health check path is /api/v1/health, not /healthz: SigNoz has no /healthz and
+    # would report every target unhealthy while the UI itself worked perfectly when
+    # reached directly.
+    healthCheck:
+      - healthyThreshold: 2
+        interval: 30
+        matcher: "200"
+        path: /api/v1/health
+        protocol: HTTP
+        timeout: 5
+        unhealthyThreshold: 3
+    name: learn-crossplane-signoz-tg
+    port: 30083
+    protocol: HTTP
+    region: us-east-1
+    targetType: ip
+    vpcIdSelector:
+      matchLabels:
+        environment: dev
+    tags:
+      Name: learn-crossplane-signoz-tg
+      Environment: dev
+---
+apiVersion: elbv2.aws.upbound.io/v1beta1
+kind: LBListener
+metadata:
+  name: learn-crossplane-signoz-listener
+spec:
+  forProvider:
+    defaultAction:
+      - targetGroupArnSelector:
+          matchLabels:
+            component: alb-signoz
+        type: forward
+    loadBalancerArnSelector:
+      matchLabels:
+        component: alb-signoz
+    port: 80
+    protocol: HTTP
+    region: us-east-1
+    tags:
+      Name: learn-crossplane-signoz-listener
+      Environment: dev
