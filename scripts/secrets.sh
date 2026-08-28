@@ -12,8 +12,13 @@
 # command rather than two.
 . "$(dirname "$0")/lib.sh"
 
-require_tool aws curl
+require_tool aws curl docker
 
+# Starts the container rather than assuming it is up. bootstrap.sh already did this, and
+# this script needing it too is not obvious: it talks to Secrets Manager on its first line.
+# Without it, running this as the very first command just waits three minutes and fails
+# with an endpoint connection error that reads like a configuration problem.
+docker compose up -d localstack
 wait_localstack
 
 echo "=== Ingesting secrets into AWS Secrets Manager ==="

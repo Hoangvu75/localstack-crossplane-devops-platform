@@ -1,3 +1,19 @@
+# ── This lab and learn-opensible are MUTUALLY EXCLUSIVE ─────────────────────
+# Both declare container_name: localstack and both publish 4566 plus 4510-4559. Only one
+# can run at a time, and Docker refuses the second with a name conflict rather than a port
+# error, which points at the wrong thing:
+#     Conflict. The container name "/localstack" is already in use
+#
+# Switching labs, from the OTHER project directory:
+#     docker compose down          # or: docker rm localstack
+#
+# That removes the container only. Each lab keeps its own emulated AWS state in its own
+# ./data/localstack bind mount, so switching back loses nothing.
+#
+# An explicit project name keeps `docker compose ps` readable and matches the sibling lab,
+# which uses learn-opensible.
+name: learn-crossplane
+
 services:
   localstack:
     image: localstack/localstack-pro:latest
