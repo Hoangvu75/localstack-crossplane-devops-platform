@@ -28,6 +28,36 @@ services:
       - DOCKER_HOST=unix:///var/run/docker.sock
       # Retain emulated resources across restarts, saved to ./data/localstack volume.
       - PERSISTENCE=1
+      # ── Without this, the EKS cluster never starts on this machine ───────
+      # LocalStack defaults K3S_IMAGE_TAG to 1.36, which resolves to
+      # rancher/k3s:v1.36.2-k3s1. That k3s dropped cgroup v1 support, and the Docker
+      # Desktop WSL2 VM here presents cgroup v1. The kubelet refuses to start:
+      #
+      #     Error: failed to validate kubelet configuration, error: kubelet is
+      #     configured to not run on a host using cgroup v1
+      #     Shutdown request received: "kubelet exited: ..."
+      #
+      # k3s exits about three seconds in. What you actually SEE is none of that: the
+      # k3d containers stay Up (the serverlb is a separate nginx container and is
+      # perfectly healthy), LocalStack polls readiness for 150 seconds, and then
+      #
+      #     Waiter ClusterActive failed: ... we matched expected path: "FAILED"
+      #     ERROR ... Error starting K3D cluster: Timeout while waiting for EKS startup
+      #
+      # which reads like a slow machine. The real error is only in
+      #     docker logs k3d-<cluster>-server-0
+      #
+      # v1.31.14-k3s1 is the last line that still supports cgroup v1, and it is what
+      # the sibling learn-opensible lab runs on this same host.
+      #
+      # The alternative fix is host-wide rather than project-local: give WSL2 a cgroup
+      # v2 hierarchy by putting this in %UserProfile%\.wslconfig
+      #     [wsl2]
+      #     kernelCommandLine = cgroup_no_v1=all
+      # then `wsl --shutdown` and restart Docker Desktop. That unpins the k3s version
+      # but changes cgroup behaviour for every container on the machine, so it is a
+      # decision about the workstation, not about this lab.
+      - K3S_IMAGE_TAG=v1.31.14-k3s1
       # Disable CSRF mitigation to allow frontend web apps to load static assets seamlessly
       - DISABLE_CORS_CHECKS=1
       # Force external CDN/Registry domains to resolve via real upstream DNS to avoid x509 cert issues
