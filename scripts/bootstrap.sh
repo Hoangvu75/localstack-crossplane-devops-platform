@@ -285,12 +285,18 @@ echo "    server available"
 #                     target group in gitops/infrastructure/loadbalancer/alb-argocd.yaml.
 echo "    applying server.insecure and the NodePort service"
 kubectl apply -f gitops/bootstrap/argocd/server-params-cm.yaml >/dev/null
+# Excludes Tekton PipelineRun/TaskRun from ArgoCD entirely. Without it ArgoCD prunes
+# running builds about 45 seconds in, because they are created at runtime and are not in
+# git. See the file for the full story.
+kubectl apply -f gitops/bootstrap/argocd/resource-exclusions-cm.yaml >/dev/null
 kubectl apply -f gitops/bootstrap/argocd/nodeport-svc.yaml >/dev/null
 
 # argocd-server reads cmd-params only at startup, so the ConfigMap alone changes nothing
 # until the pod is replaced.
 kubectl -n argocd rollout restart deployment/argocd-server >/dev/null
+kubectl -n argocd rollout restart statefulset/argocd-application-controller >/dev/null
 kubectl -n argocd rollout status deployment/argocd-server --timeout=180s >/dev/null
+kubectl -n argocd rollout status statefulset/argocd-application-controller --timeout=180s >/dev/null
 echo "    server restarted with plain HTTP on NodePort 30081"
 
 # ── 5. The credential that connects CI to CD ─────────────────────────────────

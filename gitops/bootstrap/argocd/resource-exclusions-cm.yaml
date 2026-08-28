@@ -1,0 +1,45 @@
+# Stops ArgoCD from deleting running builds.
+#
+# ── The failure this fixes ──────────────────────────────────────────────────
+# PipelineRuns and TaskRuns are created at RUNTIME -- by a webhook, by `kubectl create`,
+# by the TriggerTemplate. They are not in git and never will be. ArgoCD manages the
+# tekton-ci namespace, sees objects there that its manifests do not describe, and prunes
+# them. Its own log says so plainly:
+#
+#     Adding resource result, status: 'Pruned', phase: 'Succeeded', message: 'pruned'
+#       application=argocd/platform-tekton kind=PipelineRun name=manual-monorepo-ci-run-...
+#
+# Observed behaviour: a PipelineRun starts, the TaskRun is created, the workspace PVC is
+# provisioned, and roughly 45 seconds later the whole thing vanishes mid-build. With a
+# real webhook every single build would be killed part-way through, and the only trace is
+# a line in the application-controller log.
+#
+# ── Why exclusion and not prune: false ──────────────────────────────────────
+# Setting prune: false on the tekton Application in its config.yaml would also stop this,
+# but it disables pruning for the Tasks, Pipeline and Triggers as well, so deleting one
+# from git would silently leave it running in the cluster. Excluding just the two runtime
+# kinds keeps GitOps deletion working for everything that genuinely belongs in git.
+#
+# This is cluster-wide: ArgoCD stops watching these kinds entirely, which is correct.
+# Nothing should ever declare a PipelineRun in git.
+#
+# argocd-cm ships with an empty data block, so applying this whole ConfigMap is safe.
+# `kubectl apply` replaces data wholesale -- if you add other ArgoCD settings later, they
+# belong in THIS file, not in a second ConfigMap with the same name.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-cm
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: argocd-cm
+    app.kubernetes.io/part-of: argocd
+data:
+  resource.exclusions: |
+    - apiGroups:
+        - tekton.dev
+      kinds:
+        - PipelineRun
+        - TaskRun
+      clusters:
+        - "*"
