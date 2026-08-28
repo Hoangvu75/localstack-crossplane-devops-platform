@@ -2,7 +2,7 @@ apiVersion: tekton.dev/v1beta1
 kind: PipelineRun
 metadata:
   generateName: manual-monorepo-ci-run-
-  namespace: tekton-pipelines
+  namespace: tekton-ci
   labels:
     tekton.dev/pipeline: monorepo-ci-pipeline
 spec:

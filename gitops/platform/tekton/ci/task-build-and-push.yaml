@@ -2,7 +2,7 @@ apiVersion: tekton.dev/v1beta1
 kind: Task
 metadata:
   name: monorepo-build-and-push
-  namespace: tekton-pipelines
+  namespace: tekton-ci
 spec:
   description: Builds the six microservice images and pushes them to the LocalStack ECR registry.
   workspaces:

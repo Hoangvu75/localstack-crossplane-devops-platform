@@ -2,7 +2,7 @@ apiVersion: tekton.dev/v1beta1
 kind: Task
 metadata:
   name: git-clone
-  namespace: tekton-pipelines
+  namespace: tekton-ci
 spec:
   description: Clones a git repository into the shared workspace at a branch, tag, or commit SHA.
   workspaces:

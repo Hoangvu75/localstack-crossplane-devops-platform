@@ -23,7 +23,7 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: tekton-webhook
-  namespace: tekton-pipelines
+  namespace: tekton-ci
   annotations:
     nginx.ingress.kubernetes.io/ssl-redirect: "false"
     # The EventListener serves the webhook at /, so strip the prefix. Safe to apply

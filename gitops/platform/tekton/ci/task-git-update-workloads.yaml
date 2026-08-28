@@ -2,7 +2,7 @@ apiVersion: tekton.dev/v1beta1
 kind: Task
 metadata:
   name: git-update-workloads
-  namespace: tekton-pipelines
+  namespace: tekton-ci
 spec:
   description: Rewrites the Kustomize image tags for all six services and pushes the commit back to git.
   workspaces:
@@ -53,7 +53,7 @@ spec:
 
         if [ -z "${GITHUB_TOKEN:-}" ]; then
           echo "ERROR: secret 'git-credentials' (key: token) is missing or empty in" >&2
-          echo "       namespace tekton-pipelines. Without it this task cannot push the" >&2
+          echo "       namespace tekton-ci. Without it this task cannot push the" >&2
           echo "       updated image tags, and ArgoCD will keep deploying the old ones." >&2
           echo "" >&2
           echo "       Create it with:  make secrets && make bootstrap" >&2

@@ -2,7 +2,7 @@ apiVersion: triggers.tekton.dev/v1beta1
 kind: TriggerBinding
 metadata:
   name: github-push-binding
-  namespace: tekton-pipelines
+  namespace: tekton-ci
 spec:
   params:
     - name: gitRepositoryUrl
@@ -19,7 +19,7 @@ apiVersion: triggers.tekton.dev/v1beta1
 kind: TriggerTemplate
 metadata:
   name: ci-pipeline-trigger-template
-  namespace: tekton-pipelines
+  namespace: tekton-ci
 spec:
   params:
     - name: gitRepositoryUrl
@@ -35,7 +35,7 @@ spec:
       kind: PipelineRun
       metadata:
         generateName: monorepo-ci-run-
-        namespace: tekton-pipelines
+        namespace: tekton-ci
         labels:
           tekton.dev/pipeline: monorepo-ci-pipeline
       spec:
@@ -67,7 +67,7 @@ apiVersion: triggers.tekton.dev/v1beta1
 kind: EventListener
 metadata:
   name: ci-webhook-listener
-  namespace: tekton-pipelines
+  namespace: tekton-ci
 spec:
   serviceAccountName: tekton-triggers-sa
   triggers:

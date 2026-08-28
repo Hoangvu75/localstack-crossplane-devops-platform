@@ -2,7 +2,7 @@ apiVersion: tekton.dev/v1beta1
 kind: Pipeline
 metadata:
   name: monorepo-ci-pipeline
-  namespace: tekton-pipelines
+  namespace: tekton-ci
 spec:
   description: End-to-end CI pipeline for cloning repo, building 6 microservices to ECR, and updating GitOps manifests.
   workspaces:

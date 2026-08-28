@@ -43,7 +43,7 @@ flowchart TD
             PC["ProviderConfig to http://localstack:4566"]
         end
 
-        subgraph TEKTON["tekton-pipelines"]
+        subgraph TEKTON["tekton-pipelines + tekton-ci"]
             TEK_PIPE["Pipeline: git-clone, build+push, git-update"]
             TEK_TRIG["EventListener + github/CEL interceptors"]
             TEK_DASH["Dashboard (:9097)"]
@@ -431,7 +431,7 @@ interceptors as well — which is what you want before wiring a real webhook —
 GitHub-shaped payload at the listener:
 
 ```bash
-kubectl -n tekton-pipelines port-forward svc/el-ci-webhook-listener 8089:8080 &
+kubectl -n tekton-ci port-forward svc/el-ci-webhook-listener 8089:8080 &
 curl -X POST http://127.0.0.1:8089 -H 'X-GitHub-Event: push' -H 'Content-Type: application/json' \
   -d '{"ref":"refs/heads/main","head_commit":{"id":"'"$(git rev-parse HEAD)"'","message":"test"},"repository":{"clone_url":"https://github.com/Hoangvu75/localstack-crossplane-devops-platform.git"}}'
 ```
@@ -468,7 +468,7 @@ When an event is accepted but no `PipelineRun` appears, the reason is only in th
 own log:
 
 ```bash
-kubectl -n tekton-pipelines logs -l eventlistener=ci-webhook-listener --tail=50
+kubectl -n tekton-ci logs -l eventlistener=ci-webhook-listener --tail=50
 ```
 
 ---

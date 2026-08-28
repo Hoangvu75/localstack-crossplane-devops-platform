@@ -58,6 +58,7 @@ resources:
   - triggers-v0.34.0.yaml
   - triggers-interceptors-v0.34.0.yaml
   - dashboard-v0.63.1.yaml
+  - namespace-ci.yaml
   - rbac.yaml
   - ingress.yaml
   - ci/task-git-clone.yaml

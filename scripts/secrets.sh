@@ -46,9 +46,9 @@ echo ">>> Stored (value not echoed)."
 
 # Refresh the in-cluster copy if there is a cluster to refresh. Silently skipped on a first
 # run, when this script executes before bootstrap.sh has created anything.
-if command -v kubectl >/dev/null 2>&1 && kubectl get ns tekton-pipelines >/dev/null 2>&1; then
+if command -v kubectl >/dev/null 2>&1 && kubectl get ns tekton-ci >/dev/null 2>&1; then
   echo ">>> Cluster is up, refreshing the git-credentials Secret..."
-  kubectl -n tekton-pipelines create secret generic git-credentials \
+  kubectl -n tekton-ci create secret generic git-credentials \
     --from-literal=token="$GITHUB_TOKEN" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
   echo ">>> Refreshed. In-flight PipelineRuns keep the old value; new ones get this one."
 else

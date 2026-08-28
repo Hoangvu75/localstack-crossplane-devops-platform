@@ -61,8 +61,8 @@ status:
 	-@kubectl -n devops-apps get pods
 	@echo ""
 	@echo "── Tekton CI ────────────────────────────────────────────────"
-	-@kubectl -n tekton-pipelines get secret git-credentials
-	-@kubectl -n tekton-pipelines get pipelinerun
+	-@kubectl -n tekton-ci get secret git-credentials
+	-@kubectl -n tekton-ci get pipelinerun
 	@echo ""
 	@echo "── Entry URLs, from the last localstack-wiring run ──────────"
 	-@kubectl -n localstack-wiring logs -l app=localstack-wiring --tail=20

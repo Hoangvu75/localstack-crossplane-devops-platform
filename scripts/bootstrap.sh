@@ -320,12 +320,12 @@ if [ -z "$TOKEN" ] || [ "$TOKEN" = "dummy_token_for_local_testing" ]; then
 else
   # The namespace does not exist yet, because ArgoCD creates it when it syncs the tekton
   # Application, so create it here rather than depending on sync ordering.
-  kubectl create namespace tekton-pipelines --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  kubectl create namespace tekton-ci --dry-run=client -o yaml | kubectl apply -f - >/dev/null
   # dry-run piped to apply rather than create secret, so re-running rotates the value
   # instead of failing with AlreadyExists.
-  kubectl -n tekton-pipelines create secret generic git-credentials \
+  kubectl -n tekton-ci create secret generic git-credentials \
     --from-literal=token="$TOKEN" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-  echo "    created in tekton-pipelines (value not echoed)"
+  echo "    created in tekton-ci (value not echoed)"
 
   # ── ArgoCD repository credential ──────────────────────────────────────
   # Required whenever the repo is PRIVATE, which this one is. Without it the git files
