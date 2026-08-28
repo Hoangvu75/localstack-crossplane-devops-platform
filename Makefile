@@ -23,7 +23,7 @@ export AWS_ACCESS_KEY_ID ?= mock_access_key
 export AWS_SECRET_ACCESS_KEY ?= mock_secret_key
 export AWS_DEFAULT_REGION ?= us-east-1
 
-.PHONY: all up secrets bootstrap status run-ci destroy purge
+.PHONY: all up secrets bootstrap status verify run-ci destroy purge
 
 # secrets before bootstrap: step 5 of the bootstrap reads the token back out of Secrets
 # Manager to build the in-cluster git-credentials Secret.
@@ -66,6 +66,12 @@ status:
 	@echo ""
 	@echo "── Entry URLs, from the last localstack-wiring run ──────────"
 	-@kubectl -n localstack-wiring logs -l app=localstack-wiring --tail=20
+
+# Endpoints, credentials, ALB target health, and where the current build is. Kept as a
+# script rather than inlined here because make is not installed on every machine that
+# runs this lab, and a diagnostic you cannot reach is worse than no diagnostic.
+verify:
+	@bash scripts/verify-web-access.sh
 
 # Start the pipeline by hand. The manifest is the same one the TriggerTemplate renders,
 # so this exercises the real Pipeline but skips the interceptor chain — README §8.2 has

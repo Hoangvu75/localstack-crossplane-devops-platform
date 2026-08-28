@@ -290,13 +290,21 @@ AWS itself, so whatever it prints is what the last reconcile actually saw.
 
 | Component | Address | How |
 | :--- | :--- | :--- |
-| **ArgoCD** | `http://localhost:8080` | `kubectl -n argocd port-forward svc/argocd-server 8080:80` — user `admin`, password printed by step 03 |
+| **ArgoCD** | `http://<argocd-alb-dns>:4566/` | its own ALB, NodePort 30081 — user `admin`, password from `scripts/verify-web-access.sh`. `kubectl -n argocd port-forward svc/argocd-server 8080:80` also works. |
 | **Tekton Dashboard** | `http://localhost:9097` | `kubectl -n tekton-pipelines port-forward svc/tekton-dashboard 9097:9097` |
-| **SigNoz** | `http://localhost:3301` | `kubectl -n signoz port-forward svc/signoz-frontend 3301:3301` |
+| **SigNoz** | `http://<signoz-alb-dns>:4566/` | its own ALB, NodePort 30083. No generated password: the first visit asks you to create an account. |
 | **Web app via ALB** | `http://<alb-dns>:4566/` | ALB DNS name printed by steps 04 and 05 |
 | **Web app via CloudFront** | `http://<dist-id>.cloudfront.localhost.localstack.cloud:4566/` | printed by step 04 |
 | **Tekton webhook** | `http://<alb-dns>:4566/tekton-webhook` | POST only; this is the URL to aim a tunnel at |
 | **LocalStack gateway** | `http://localhost:4566` | |
+
+Every address above is assigned by LocalStack at creation time and changes whenever the
+emulated resources are recreated, so do not write them down. Read them, together with the
+credentials, the ALB target health and the state of the current build:
+
+```bash
+bash scripts/verify-web-access.sh
+```
 
 The `:4566` is not optional — LocalStack binds nothing on port 80 and multiplexes every
 emulated endpoint behind its gateway, routing by `Host` header.
