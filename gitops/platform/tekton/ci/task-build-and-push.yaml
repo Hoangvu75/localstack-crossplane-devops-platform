@@ -42,8 +42,25 @@ spec:
         #!/usr/bin/env sh
         set -eu
 
-        echo ">>> Starting Docker daemon (insecure registry: ${DOCKER_INSECURE_REGISTRY})..."
-        dockerd-entrypoint.sh --insecure-registry "${DOCKER_INSECURE_REGISTRY}" >/tmp/dockerd.log 2>&1 &
+        # ── --mtu is why this build takes minutes instead of an hour ─────────
+        # dockerd defaults its bridge to MTU 1500 and hands 1500 to every build container.
+        # But this pod sits behind flannel VXLAN, whose 50 bytes of encapsulation leave the
+        # pod eth0 at 1450. Anything between 1451 and 1500 bytes is silently dropped, and
+        # path MTU discovery does not survive four levels of nesting (build container ->
+        # docker0 -> pod eth0 -> cni0 -> k3d node -> Docker Desktop).
+        #
+        # Measured symptom, and it is deceptive: DNS answered in 0s because queries are
+        # small UDP, while an HTTPS GET to registry.npmjs.org timed out at 20s because the
+        # TLS handshake and every bulk transfer need full-size frames. npm then crawled --
+        # `npm ci` for apps/web took 47 MINUTES and finally tripped
+        #     npm error Exit handler never called!
+        # exiting 0 with an empty node_modules. Nothing in that chain says MTU.
+        #
+        # Read from the pod interface rather than hardcoded, so a change in the CNI or its
+        # overhead does not silently reintroduce the same stall.
+        POD_MTU=$(cat /sys/class/net/eth0/mtu 2>/dev/null || echo 1450)
+        echo ">>> Starting Docker daemon (insecure registry: ${DOCKER_INSECURE_REGISTRY}, mtu: ${POD_MTU})..."
+        dockerd-entrypoint.sh --insecure-registry "${DOCKER_INSECURE_REGISTRY}" --mtu="${POD_MTU}" >/tmp/dockerd.log 2>&1 &
 
         # Bounded wait. The old `until docker info; do sleep 1; done` had no ceiling, so a
         # daemon that failed to start turned into a task that hung until the PipelineRun
