@@ -1,0 +1,39 @@
+# Exposes the Tekton Dashboard on a NodePort so a dedicated ALB can reach it.
+#
+# ── Why the Dashboard gets its own ALB ──────────────────────────────────────
+# It serves its UI and assets from /, and the host-less path / on the application ALB is
+# already taken by the web app. Putting the Dashboard on a subpath there would need a
+# base-href rewrite. A separate ALB pointed straight at this NodePort avoids the question
+# entirely, which is the same shape ArgoCD and SigNoz use.
+#
+# nodePort 30082 is a CONTRACT with the target group in
+# gitops/infrastructure/loadbalancer/alb-tekton.yaml. 30080/30081/30083 are taken by
+# ingress-nginx, argocd-server and signoz; 30082 was the gap.
+#
+# This Service lives in tekton-pipelines, not tekton-ci: it selects the Dashboard pods,
+# and those come from the upstream release. Only PipelineRuns moved to tekton-ci.
+# The upstream tekton-dashboard Service is left untouched, so `port-forward` keeps working.
+apiVersion: v1
+kind: Service
+metadata:
+  name: tekton-dashboard-nodeport
+  namespace: tekton-pipelines
+  labels:
+    app.kubernetes.io/name: tekton-dashboard-nodeport
+    app.kubernetes.io/part-of: tekton-dashboard
+spec:
+  type: NodePort
+  # Copied verbatim from the upstream tekton-dashboard Service. If the release changes
+  # these labels, this Service silently selects nothing and the ALB returns 503 with the
+  # target group still reporting healthy, because LocalStack health checks the node port
+  # rather than the pod.
+  selector:
+    app.kubernetes.io/component: dashboard
+    app.kubernetes.io/instance: default
+    app.kubernetes.io/name: dashboard
+    app.kubernetes.io/part-of: tekton-dashboard
+  ports:
+    - name: http
+      port: 9097
+      targetPort: 9097
+      nodePort: 30082

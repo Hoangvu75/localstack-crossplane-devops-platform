@@ -45,11 +45,13 @@ hr
 APP_DNS=$(alb_dns "${PROJECT_NAME}-alb")
 ARGO_DNS=$(alb_dns "${PROJECT_NAME}-argocd-alb")
 SIGNOZ_DNS=$(alb_dns "${PROJECT_NAME}-signoz-alb")
+TEKTON_DNS=$(alb_dns "${PROJECT_NAME}-tekton-alb")
 CF_DOMAIN=$(aws_ cloudfront list-distributions \
   --query 'DistributionList.Items[0].DomainName' --output text 2>/dev/null || echo "")
 
 for ROW in "Web app|${APP_DNS}" \
            "ArgoCD|${ARGO_DNS}" \
+           "Tekton|${TEKTON_DNS}" \
            "SigNoz|${SIGNOZ_DNS}" \
            "CloudFront|${CF_DOMAIN}"; do
   NAME="${ROW%%|*}"
@@ -103,6 +105,7 @@ hr
 # re-registers these every two minutes.
 for PAIR in "${PROJECT_NAME}-tg-ip:30080:web app via ingress-nginx" \
             "${PROJECT_NAME}-argocd-tg:30081:argocd-server-nodeport" \
+            "${PROJECT_NAME}-tekton-tg:30082:tekton-dashboard-nodeport" \
             "${PROJECT_NAME}-signoz-tg:30083:signoz-nodeport"; do
   TG="${PAIR%%:*}"
   REST="${PAIR#*:}"
@@ -190,9 +193,16 @@ cat <<'HELP'
   Per-service progress only:
     kubectl -n tekton-ci logs "$POD" --all-containers | grep -E '^>>> (Building|OK)'
 
-  Tekton Dashboard, with a graphical view of the pipeline and per-step logs. It is NOT
-  behind an ALB, because it serves its assets from / and the host-less path there is
-  already taken by the application:
+  Tekton Dashboard -- graphical pipeline view and per-step logs, the easiest way to watch
+  a build. It has its OWN ALB (NodePort 30082), so no port-forward is needed. The URL is
+  printed in the ENDPOINTS section above.
+
+  It opens on whichever namespace you pick in the header. PipelineRuns live in tekton-ci,
+  not tekton-pipelines -- the controllers are in tekton-pipelines and the runs were moved
+  out because that namespace enforces PodSecurity restricted.
+
+  port-forward still works if the ALB is not up yet, because the upstream Service was
+  left untouched:
     kubectl -n tekton-pipelines port-forward svc/tekton-dashboard 9097:9097
     http://localhost:9097
 

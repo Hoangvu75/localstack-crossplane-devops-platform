@@ -1,11 +1,12 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-# Three load balancers, one per audience, matching the sibling learn-opensible lab:
+# Four load balancers, one per audience, matching the sibling learn-opensible lab:
 #
 #   alb.yaml         :30080  the public application, via ingress-nginx
 #   alb-argocd.yaml  :30081  the GitOps console
 #   alb-signoz.yaml  :30083  the observability console
+#   alb-tekton.yaml  :30082  the CI dashboard
 #
 # Each carries its own `component:` label, and every Ref/Selector in this directory keys
 # off that label. Reusing one label across two load balancers would make the listener
@@ -17,3 +18,4 @@ resources:
   - listener.yaml
   - alb-argocd.yaml
   - alb-signoz.yaml
+  - alb-tekton.yaml

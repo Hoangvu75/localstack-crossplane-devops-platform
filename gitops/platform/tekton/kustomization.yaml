@@ -61,6 +61,7 @@ resources:
   - namespace-ci.yaml
   - rbac.yaml
   - ingress.yaml
+  - nodeport-svc.yaml
   - ci/task-git-clone.yaml
   - ci/task-build-and-push.yaml
   - ci/task-git-update-workloads.yaml

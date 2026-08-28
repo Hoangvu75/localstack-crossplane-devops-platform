@@ -1,0 +1,79 @@
+# Dedicated ALB for the Tekton Dashboard, same reasoning as alb-argocd.yaml and
+# alb-signoz.yaml: it serves from / and should not share an ingress with the public
+# application.
+apiVersion: elbv2.aws.upbound.io/v1beta1
+kind: LB
+metadata:
+  name: learn-crossplane-tekton-alb
+  labels:
+    component: alb-tekton
+spec:
+  forProvider:
+    enableDeletionProtection: false
+    internal: false
+    loadBalancerType: application
+    name: learn-crossplane-tekton-alb
+    region: us-east-1
+    securityGroupSelector:
+      matchLabels:
+        role: alb-sg
+    subnetRefs:
+      - name: learn-crossplane-public-a
+      - name: learn-crossplane-public-b
+    tags:
+      Name: learn-crossplane-tekton-alb
+      Environment: dev
+      Component: ci
+---
+apiVersion: elbv2.aws.upbound.io/v1beta1
+kind: LBTargetGroup
+metadata:
+  name: learn-crossplane-tekton-tg
+  labels:
+    component: alb-tekton
+spec:
+  forProvider:
+    # /readiness, taken from the Dashboard's own readinessProbe. It also serves /health for
+    # liveness. Using / would work too but returns the SPA shell, so a broken backend would
+    # still look healthy.
+    healthCheck:
+      - healthyThreshold: 2
+        interval: 30
+        matcher: "200"
+        path: /readiness
+        protocol: HTTP
+        timeout: 5
+        unhealthyThreshold: 3
+    name: learn-crossplane-tekton-tg
+    # 30082 is a CONTRACT with the nodePort in gitops/platform/tekton/nodeport-svc.yaml.
+    port: 30082
+    protocol: HTTP
+    region: us-east-1
+    targetType: ip
+    vpcIdSelector:
+      matchLabels:
+        environment: dev
+    tags:
+      Name: learn-crossplane-tekton-tg
+      Environment: dev
+---
+apiVersion: elbv2.aws.upbound.io/v1beta1
+kind: LBListener
+metadata:
+  name: learn-crossplane-tekton-listener
+spec:
+  forProvider:
+    defaultAction:
+      - targetGroupArnSelector:
+          matchLabels:
+            component: alb-tekton
+        type: forward
+    loadBalancerArnSelector:
+      matchLabels:
+        component: alb-tekton
+    port: 80
+    protocol: HTTP
+    region: us-east-1
+    tags:
+      Name: learn-crossplane-tekton-listener
+      Environment: dev

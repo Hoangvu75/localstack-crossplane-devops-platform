@@ -40,6 +40,7 @@ data:
     #
     #   -tg-ip     :30080  ingress-nginx, the public application
     #   -argocd-tg :30081  argocd-server-nodeport
+    #   -tekton-tg :30082  tekton-dashboard-nodeport
     #   -signoz-tg :30083  signoz-nodeport
     #
     # k3d gives the node a new container IP on every cluster recreation, which is why
@@ -48,7 +49,7 @@ data:
     if [ -z "${NODE_IP}" ]; then
       echo "WARNING: could not read the node InternalIP, skipping target registration"
     else
-      for PAIR in "${PROJECT}-tg-ip:30080" "${PROJECT}-argocd-tg:30081" "${PROJECT}-signoz-tg:30083"; do
+      for PAIR in "${PROJECT}-tg-ip:30080" "${PROJECT}-argocd-tg:30081" "${PROJECT}-tekton-tg:30082" "${PROJECT}-signoz-tg:30083"; do
         TG_N="${PAIR%%:*}"
         TG_P="${PAIR##*:}"
         TG_ARN=$(aws elbv2 describe-target-groups --names "${TG_N}" --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null || echo "")
@@ -130,7 +131,7 @@ data:
     # entry URLs without querying anything itself.
     CF_DOMAIN=$(kubectl get distributions.v1beta1.cloudfront.aws.upbound.io "${CF_MR}" -o jsonpath='{.status.atProvider.domainName}' 2>/dev/null || echo "")
     echo "ENDPOINT App        http://${ALB_DNS}:4566/"
-    for PAIR in "argocd-alb:ArgoCD" "signoz-alb:SigNoz"; do
+    for PAIR in "argocd-alb:ArgoCD" "tekton-alb:Tekton" "signoz-alb:SigNoz"; do
       LB_N="${PROJECT}-${PAIR%%:*}"
       LB_LABEL="${PAIR##*:}"
       D=$(aws elbv2 describe-load-balancers --names "${LB_N}" --query 'LoadBalancers[0].DNSName' --output text 2>/dev/null || echo "")
