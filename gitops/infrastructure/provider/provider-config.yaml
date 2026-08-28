@@ -8,7 +8,7 @@
 #
 # Writing them in camelCase (s3UsePathStyle, skipCredentialsValidation, …) is NOT an
 # error. The CRD is a structural schema, so the API server PRUNES the unknown fields
-# and accepts the object. `kubectl get providerconfig -o yaml` then shows a spec with
+# and accepts the object. `kubectl get providerconfigs.aws.upbound.io -o yaml` then shows a
 # the toggles simply absent — nothing anywhere says why.
 #
 # The symptom is downstream and looks unrelated: the provider tries to validate
@@ -17,7 +17,7 @@
 # appear to work.
 #
 # Verify after any edit that all five survived:
-#   kubectl get providerconfig default -o jsonpath='{.spec}' | tr ',' '\n' | grep skip
+#   kubectl get providerconfigs.aws.upbound.io default -o jsonpath='{.spec}' | tr ',' '\n' | grep skip
 #
 # ── hostnameImmutable ────────────────────────────────────────────────────────
 # Without it the AWS SDK rewrites the endpoint host per service (s3.localstack,

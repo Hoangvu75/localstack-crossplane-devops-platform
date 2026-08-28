@@ -21,7 +21,13 @@ data:
     # camelCase the API server prunes them silently, and the only visible effect is S3
     # failing much later against a virtual-hosted URL. Asserted on every loop because
     # this is the failure that looks like anything except its cause.
-    TOGGLES=$(kubectl get providerconfig default -o json 2>/dev/null | grep -c 'skip_[a-z_]*": true' || true)
+    #
+    # The resource name is fully qualified, not the bare "providerconfig": once the
+    # providers are installed, both providerconfigs and providerconfigusages match that
+    # prefix and kubectl refuses with "error: you must specify only one resource". The
+    # count then comes back 0 and this assertion fires against a ProviderConfig that is
+    # completely correct.
+    TOGGLES=$(kubectl get providerconfigs.aws.upbound.io default -o json 2>/dev/null | grep -c 'skip_[a-z_]*": true' || true)
     if [ "${TOGGLES:-0}" -lt 4 ]; then
       echo "WARNING: providerconfig/default has ${TOGGLES:-0} skip_ toggles, expected 4."
       echo "         They were pruned by the API server. Check for camelCase field names"

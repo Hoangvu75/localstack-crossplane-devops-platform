@@ -246,7 +246,12 @@ kubectl apply -f gitops/infrastructure/provider/provider-config.yaml >/dev/null
 # The four LocalStack toggles are snake_case in the CRD. In camelCase they are pruned
 # silently and every S3 call then addresses a virtual-hosted URL. Assert, do not hope.
 # The localstack-wiring CronJob re-checks this on every loop.
-TOGGLES=$(kubectl get providerconfig default -o json | grep -c 'skip_[a-z_]*": true' || true)
+#
+# The resource name is fully qualified, not the bare "providerconfig": once the providers
+# are installed, both providerconfigs and providerconfigusages match that prefix and
+# kubectl refuses with "error: you must specify only one resource". The count then comes
+# back 0 and this assertion fires against a ProviderConfig that is completely correct.
+TOGGLES=$(kubectl get providerconfigs.aws.upbound.io default -o json | grep -c 'skip_[a-z_]*": true' || true)
 if [ "${TOGGLES}" -lt 4 ]; then
   echo "ERROR: expected 4 skip_ toggles on providerconfig/default, found ${TOGGLES}." >&2
   echo "       They were pruned by the API server. Check for camelCase field names in" >&2
