@@ -43,12 +43,48 @@ wait_localstack eks
 if aws_ eks describe-cluster --name "$CLUSTER_NAME" >/dev/null 2>&1; then
   echo "    cluster ${CLUSTER_NAME} already exists"
 else
-  echo "    creating cluster ${CLUSTER_NAME}..."
+  # ── Why the subnets are discovered rather than written down ──────────────
+  # This call used to pass the literal subnetIds=subnet-mock-1,subnet-mock-2. LocalStack
+  # validates subnet ids against its own EC2 service and rejects invented ones:
+  #     An error occurred (InvalidParameterException) when calling the CreateCluster
+  #     operation: The subnet ID subnet-mock-2 does not exist
+  #
+  # The subnets CANNOT come from gitops/infrastructure/networking/, and that is the part
+  # worth understanding. Those manifests are reconciled by Crossplane, which runs as a
+  # Deployment INSIDE this cluster, so the cluster must exist before its own VPC can be
+  # created. A control plane cannot provision the thing that hosts it.
+  #
+  # So the cluster sits in the account default VPC (172.31.0.0/16, created by LocalStack
+  # at startup) while everything Crossplane manages lives in 10.0.0.0/16. On LocalStack
+  # that split is metadata only: the k3d containers sit on a Docker network and pay no
+  # attention to either CIDR. On real AWS you would create the cluster VPC in a separate
+  # bootstrap stack and pass its subnet ids here instead — see README section 7.
+  DEFAULT_VPC=$(aws_ ec2 describe-vpcs --filters Name=isDefault,Values=true \
+    --query 'Vpcs[0].VpcId' --output text 2>/dev/null || echo "")
+  if [ -z "$DEFAULT_VPC" ] || [ "$DEFAULT_VPC" = "None" ]; then
+    echo "ERROR: LocalStack reports no default VPC. It normally creates one at startup." >&2
+    echo "       Check:  aws --endpoint-url ${AWS_ENDPOINT} ec2 describe-vpcs" >&2
+    exit 1
+  fi
+
+  # EKS requires at least two subnets in different availability zones. The default VPC is
+  # given one subnet per AZ, so the first two are always in different zones.
+  BOOT_SUBNETS=$(aws_ ec2 describe-subnets --filters "Name=vpc-id,Values=${DEFAULT_VPC}" \
+    --query 'Subnets[0:2].SubnetId' --output text 2>/dev/null | tr '\t' ',')
+  if [ "$(echo "$BOOT_SUBNETS" | tr ',' '\n' | grep -c .)" -lt 2 ]; then
+    echo "ERROR: fewer than two subnets in default VPC ${DEFAULT_VPC}." >&2
+    echo "       Got: ${BOOT_SUBNETS:-none}" >&2
+    exit 1
+  fi
+
+  echo "    creating cluster ${CLUSTER_NAME} in ${DEFAULT_VPC}"
+  echo "    bootstrap subnets: ${BOOT_SUBNETS}"
   aws_ eks create-cluster \
     --name "$CLUSTER_NAME" \
     --role-arn "arn:aws:iam::000000000000:role/eks-cluster-role" \
-    --resources-vpc-config subnetIds=subnet-mock-1,subnet-mock-2 >/dev/null
-  echo "    waiting for ACTIVE (LocalStack starts a k3d cluster)..."
+    --resources-vpc-config "subnetIds=${BOOT_SUBNETS}" >/dev/null
+  echo "    waiting for ACTIVE. On a first run LocalStack downloads k3d, docker-registry"
+  echo "    and nginx into ./data/localstack first, so this takes 5-15 minutes."
   aws_ eks wait cluster-active --name "$CLUSTER_NAME"
 fi
 
