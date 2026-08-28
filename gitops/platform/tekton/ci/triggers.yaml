@@ -1,0 +1,117 @@
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: github-push-binding
+  namespace: tekton-pipelines
+spec:
+  params:
+    - name: gitRepositoryUrl
+      value: $(body.repository.clone_url)
+    # A full commit SHA, not a branch name. task-git-clone.yaml detects the shape and
+    # fetches accordingly — see the long note there about why `git clone --branch <sha>`
+    # can never work.
+    - name: gitRevision
+      value: $(body.head_commit.id)
+    - name: gitRef
+      value: $(body.ref)
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: ci-pipeline-trigger-template
+  namespace: tekton-pipelines
+spec:
+  params:
+    - name: gitRepositoryUrl
+      description: The git repository URL to clone.
+    - name: gitRevision
+      description: The commit SHA to build.
+      default: main
+    - name: gitRef
+      description: The pushed ref, e.g. refs/heads/main.
+      default: refs/heads/main
+  resourcetemplates:
+    - apiVersion: tekton.dev/v1beta1
+      kind: PipelineRun
+      metadata:
+        generateName: monorepo-ci-run-
+        namespace: tekton-pipelines
+        labels:
+          tekton.dev/pipeline: monorepo-ci-pipeline
+      spec:
+        pipelineRef:
+          name: monorepo-ci-pipeline
+        # Without a timeout a wedged dind step occupies the workspace PVC indefinitely.
+        timeouts:
+          pipeline: "45m"
+        params:
+          - name: repoUrl
+            value: $(tt.params.gitRepositoryUrl)
+          - name: gitRevision
+            value: $(tt.params.gitRevision)
+          - name: registryHost
+            value: "000000000000.dkr.ecr.us-east-1.localhost.localstack.cloud:4566"
+          - name: projectName
+            value: "learn-crossplane"
+        workspaces:
+          - name: shared-data
+            volumeClaimTemplate:
+              spec:
+                accessModes:
+                  - ReadWriteOnce
+                resources:
+                  requests:
+                    storage: 2Gi
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: ci-webhook-listener
+  namespace: tekton-pipelines
+spec:
+  serviceAccountName: tekton-triggers-sa
+  triggers:
+    - name: github-push-trigger
+      # ── Why interceptors are not optional here ──────────────────────────────
+      # This trigger had none, which meant every POST to the EventListener started a
+      # build. Two consequences, one of them self-inflicted and unbounded:
+      #
+      #   1. INFINITE CI LOOP. The last task of the pipeline commits the new image tags
+      #      and pushes to main. That push fires the webhook, which starts a build, which
+      #      pushes again. The commit message already carried `[skip ci]` — but nothing
+      #      read it. Marker plus filter is what actually stops the loop; the marker alone
+      #      is decoration.
+      #   2. Any push to any branch, and any unrelated event type, built and published
+      #      images tagged as if they came from main.
+      interceptors:
+        # eventTypes rejects anything that is not a push before the CEL filter runs.
+        #
+        # secretRef is deliberately absent: it validates GitHub's HMAC signature, which
+        # requires a shared secret this lab does not have while the listener is only
+        # reachable over kubectl port-forward. THE MOMENT this EventListener is exposed to
+        # the internet (ngrok, cloudflared, a real ingress), add it — an unauthenticated
+        # listener will build and push whatever anyone POSTs to it:
+        #
+        #   - name: secretRef
+        #     value:
+        #       secretName: github-webhook-secret
+        #       secretKey: secretToken
+        - ref:
+            name: github
+          params:
+            - name: eventTypes
+              value: ["push"]
+        - ref:
+            name: cel
+          params:
+            - name: filter
+              # has(body.head_commit) guards branch-deletion and tag events, where
+              # head_commit is null and dereferencing .message would error out.
+              value: >-
+                body.ref == 'refs/heads/main' &&
+                has(body.head_commit) &&
+                !body.head_commit.message.contains('[skip ci]')
+      bindings:
+        - ref: github-push-binding
+      template:
+        ref: ci-pipeline-trigger-template

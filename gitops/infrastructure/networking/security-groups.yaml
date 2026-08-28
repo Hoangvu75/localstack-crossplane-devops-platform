@@ -1,0 +1,60 @@
+apiVersion: ec2.aws.upbound.io/v1beta1
+kind: SecurityGroup
+metadata:
+  name: learn-crossplane-alb-sg
+  labels:
+    role: alb-sg
+spec:
+  forProvider:
+    description: Security Group for ALB
+    name: learn-crossplane-alb-sg
+    region: us-east-1
+    vpcIdSelector:
+      matchLabels:
+        environment: dev
+    tags:
+      Name: learn-crossplane-alb-sg
+      Environment: dev
+---
+# The rules below are declared separately rather than as inline `ingress`/`egress` blocks
+# on the SecurityGroup: mixing the two makes Crossplane and AWS fight over ownership of
+# the rule set on every reconcile.
+#
+# They were missing entirely, and LocalStack hid it — it accepts a SecurityGroup and never
+# enforces it, so the ALB answered anyway. On real AWS a group with no ingress rule denies
+# everything and the load balancer just times out with nothing in the logs. This is exactly
+# the class of bug a LocalStack lab is worst at catching, so it is worth being explicit.
+apiVersion: ec2.aws.upbound.io/v1beta1
+kind: SecurityGroupRule
+metadata:
+  name: learn-crossplane-alb-sg-ingress-http
+spec:
+  forProvider:
+    region: us-east-1
+    type: ingress
+    protocol: tcp
+    fromPort: 80
+    toPort: 80
+    cidrBlocks:
+      - 0.0.0.0/0
+    securityGroupIdSelector:
+      matchLabels:
+        role: alb-sg
+---
+apiVersion: ec2.aws.upbound.io/v1beta1
+kind: SecurityGroupRule
+metadata:
+  name: learn-crossplane-alb-sg-egress-all
+spec:
+  forProvider:
+    region: us-east-1
+    type: egress
+    # protocol "-1" with port 0-0 is the AWS spelling of "all protocols, all ports".
+    protocol: "-1"
+    fromPort: 0
+    toPort: 0
+    cidrBlocks:
+      - 0.0.0.0/0
+    securityGroupIdSelector:
+      matchLabels:
+        role: alb-sg

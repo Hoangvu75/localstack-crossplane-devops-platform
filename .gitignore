@@ -1,0 +1,17 @@
+.env
+.env.local
+.tmp/
+data/
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+*.log
+.DS_Store
+Thumbs.db
+node_modules/
+.next/
+dist/
+build/
+kubeconfig
+kubeconfig.local

@@ -1,0 +1,61 @@
+# How every Upbound AWS provider reaches LocalStack instead of real AWS.
+#
+# ── The trap that cost the most time here ────────────────────────────────────
+# The CRD `providerconfigs.aws.upbound.io` declares these four toggles in SNAKE_CASE:
+#
+#     s3_use_path_style   skip_credentials_validation
+#     skip_region_validation   skip_metadata_api_check   skip_requesting_account_id
+#
+# Writing them in camelCase (s3UsePathStyle, skipCredentialsValidation, …) is NOT an
+# error. The CRD is a structural schema, so the API server PRUNES the unknown fields
+# and accepts the object. `kubectl get providerconfig -o yaml` then shows a spec with
+# the toggles simply absent — nothing anywhere says why.
+#
+# The symptom is downstream and looks unrelated: the provider tries to validate
+# credentials against real STS, queries the EC2 metadata API, and addresses S3
+# virtual-hosted style (http://bucket.localstack:4566), so buckets fail while VPCs
+# appear to work.
+#
+# Verify after any edit that all five survived:
+#   kubectl get providerconfig default -o jsonpath='{.spec}' | tr ',' '\n' | grep skip
+#
+# ── hostnameImmutable ────────────────────────────────────────────────────────
+# Without it the AWS SDK rewrites the endpoint host per service (s3.localstack,
+# ecr.localstack …). `true` means "use the URL below verbatim". Required for any
+# single-endpoint emulator; harmless to remove when moving to real AWS along with
+# the whole `endpoint` block.
+apiVersion: aws.upbound.io/v1beta1
+kind: ProviderConfig
+metadata:
+  name: default
+spec:
+  credentials:
+    source: Secret
+    secretRef:
+      namespace: crossplane-system
+      name: aws-creds
+      key: credentials
+  endpoint:
+    # Resolved from inside the EKS (k3d) cluster, where the provider pods run — not
+    # from the host. `localstack` is the compose service name on the shared Docker
+    # network. If provider pods report "no such host", switch to
+    # http://localhost.localstack.cloud:4566, which LocalStack's own DNS resolves.
+    url:
+      type: Static
+      static: http://localstack:4566
+    hostnameImmutable: true
+    source: Custom
+    services:
+      - s3
+      - ec2
+      - ecr
+      - elbv2
+      - iam
+      - route53
+      - cloudfront
+      - sts
+  s3_use_path_style: true
+  skip_credentials_validation: true
+  skip_region_validation: true
+  skip_metadata_api_check: true
+  skip_requesting_account_id: true

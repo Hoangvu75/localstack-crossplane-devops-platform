@@ -1,0 +1,5 @@
+name: iac-networking
+namespace: crossplane-system
+manifestPath: gitops/infrastructure/networking
+syncWave: "2"
+prune: "true"

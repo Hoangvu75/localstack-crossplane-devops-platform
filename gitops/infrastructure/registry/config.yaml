@@ -1,0 +1,5 @@
+name: iac-registry
+namespace: crossplane-system
+manifestPath: gitops/infrastructure/registry
+syncWave: "2"
+prune: "true"

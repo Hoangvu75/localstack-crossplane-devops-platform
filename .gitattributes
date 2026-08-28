@@ -1,0 +1,44 @@
+# ── Why this file is not optional on Windows ────────────────────────────────
+# core.autocrlf=true is set globally on the development machine, so without the rules
+# below git checks these files out with CRLF endings. Three distinct failures follow, and
+# none of them names line endings in its error message:
+#
+#   *.sh          `#!/usr/bin/env bash` becomes `...bash\r`, and the kernel looks for an
+#                 interpreter literally called "bash\r":
+#                     bash: ./scripts/bootstrap.sh: /usr/bin/env: bad interpreter
+#
+#   *.yaml        The worst of the three, because it survives all the way into the
+#                 cluster. gitops/platform/localstack-wiring/cronjob.yaml carries a shell
+#                 script inside a ConfigMap block scalar. CRLF in the YAML puts a carriage
+#                 return at the end of every line of that script, so the in-cluster `sh`
+#                 sees `set -eu\r` and `fi\r`. Same for every Tekton `script:` block. YAML
+#                 itself parses fine, which is what makes it hard to find.
+#
+#   .env          Sourced by scripts/lib.sh. `AWS_DEFAULT_REGION=us-east-1\r` reaches the
+#                 AWS CLI as an invalid region. lib.sh strips CR defensively for exactly
+#                 this reason, but the fix belongs here as well as there.
+#
+# `text eol=lf` means: normalise to LF in the repository AND check out as LF regardless of
+# core.autocrlf. Editors on Windows handle LF fine; the shells and parsers above do not
+# handle CRLF at all.
+#
+# After adding this file, existing entries in the index still hold CRLF. Renormalise once:
+#     git add --renormalize .
+* text=auto
+
+*.sh        text eol=lf
+*.yaml      text eol=lf
+*.yml       text eol=lf
+Makefile    text eol=lf
+.env        text eol=lf
+.env.*      text eol=lf
+Dockerfile  text eol=lf
+*.md        text eol=lf
+
+# Binaries LocalStack caches under ./data are gitignored, but be explicit in case the
+# ignore rule is ever relaxed.
+*.png       binary
+*.svg       text eol=lf
+*.avro      binary
+*.pem       text eol=lf
+*.crt       text eol=lf

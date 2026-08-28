@@ -1,0 +1,31 @@
+apiVersion: elbv2.aws.upbound.io/v1beta1
+kind: LB
+metadata:
+  name: learn-crossplane-alb
+  labels:
+    component: alb
+spec:
+  forProvider:
+    enableDeletionProtection: false
+    internal: false
+    loadBalancerType: application
+    name: learn-crossplane-alb
+    region: us-east-1
+    securityGroupSelector:
+      matchLabels:
+        role: alb-sg
+    # `subnetRefs`, NOT `subnetIdRefs`. A reference helper is named after the AWS field
+    # it fills, and on elbv2 LB that field is `subnets` (a plural list of ids), so the
+    # generated trio is subnets / subnetRefs / subnetSelector. `subnetIdRefs` is absent
+    # from the CRD, gets pruned in silence, and the LB then fails to create because an
+    # application load balancer requires at least two subnets.
+    #
+    # Do not "fix" RouteTableAssociation to match this: its AWS field really is
+    # `subnetId`, so `subnetIdRef` there is correct. The suffix follows the field name,
+    # not a house style.
+    subnetRefs:
+      - name: learn-crossplane-public-a
+      - name: learn-crossplane-public-b
+    tags:
+      Name: learn-crossplane-alb
+      Environment: dev

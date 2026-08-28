@@ -1,0 +1,81 @@
+apiVersion: s3.aws.upbound.io/v1beta1
+kind: Bucket
+metadata:
+  name: learn-crossplane-cicd-artifacts
+  labels:
+    component: cicd
+spec:
+  forProvider:
+    forceDestroy: true
+    region: us-east-1
+    tags:
+      Name: learn-crossplane-cicd-artifacts
+      Environment: dev
+      Component: cicd
+---
+apiVersion: s3.aws.upbound.io/v1beta1
+kind: BucketPublicAccessBlock
+metadata:
+  name: learn-crossplane-cicd-artifacts-pab
+spec:
+  forProvider:
+    blockPublicAcls: true
+    blockPublicPolicy: true
+    ignorePublicAcls: true
+    restrictPublicBuckets: true
+    region: us-east-1
+    bucketSelector:
+      matchLabels:
+        component: cicd
+---
+apiVersion: s3.aws.upbound.io/v1beta1
+kind: BucketServerSideEncryptionConfiguration
+metadata:
+  name: learn-crossplane-cicd-artifacts-sse
+spec:
+  forProvider:
+    region: us-east-1
+    bucketSelector:
+      matchLabels:
+        component: cicd
+    rule:
+      - applyServerSideEncryptionByDefault:
+          - sseAlgorithm: AES256
+        bucketKeyEnabled: true
+---
+apiVersion: s3.aws.upbound.io/v1beta1
+kind: BucketVersioning
+metadata:
+  name: learn-crossplane-cicd-artifacts-ver
+spec:
+  forProvider:
+    region: us-east-1
+    bucketSelector:
+      matchLabels:
+        component: cicd
+    versioningConfiguration:
+      - status: Enabled
+---
+apiVersion: s3.aws.upbound.io/v1beta1
+kind: BucketLifecycleConfiguration
+metadata:
+  name: learn-crossplane-cicd-artifacts-lifecycle
+spec:
+  forProvider:
+    region: us-east-1
+    bucketSelector:
+      matchLabels:
+        component: cicd
+    rule:
+      - id: expire-old-source-versions
+        # AWS rejects a lifecycle rule carrying neither `filter` nor `prefix` with
+        # MalformedXML. An empty prefix is the AWS spelling of "every object in the
+        # bucket". LocalStack accepts the rule without it, so this is another one that
+        # only surfaces on the real thing.
+        filter:
+          - prefix: ""
+        status: Enabled
+        noncurrentVersionExpiration:
+          - noncurrentDays: 7
+        abortIncompleteMultipartUpload:
+          - daysAfterInitiation: 1

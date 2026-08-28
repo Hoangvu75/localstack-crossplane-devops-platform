@@ -1,0 +1,5 @@
+name: iac-compositions
+namespace: crossplane-system
+manifestPath: gitops/infrastructure/compositions
+syncWave: "1"
+prune: "true"

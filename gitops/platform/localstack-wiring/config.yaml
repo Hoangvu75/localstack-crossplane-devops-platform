@@ -1,0 +1,30 @@
+# The two pieces of platform state that cannot be expressed as a manifest, running as a
+# controller inside the cluster instead of as scripts on the host.
+#
+#   1. ALB target group membership — k3d gives the node a new container IP on every
+#      cluster recreation, so the target cannot be written down.
+#   2. The CloudFront origin domain and the Route53 alias — both need the ALB's DNS name,
+#      which AWS assigns at creation time, and neither field has a *Ref/*Selector helper
+#      pointing at elbv2 LB.
+#
+# ── Why this replaced scripts 04 and 05 ──────────────────────────────────────
+# Both jobs used to be one-shot host scripts you had to remember to re-run: `make cdn`
+# after the ALB appeared, `make verify` again after every cluster recreation. That is
+# imperative in the way GitOps exists to remove — the desired state was real, but it lived
+# in a script's argv instead of in git, and nothing corrected it when it drifted.
+#
+# As a CronJob it is declared in git, versioned with everything else, and reconciles on a
+# two-minute loop: it no longer matters whether the ALB exists yet when it first runs, or
+# whether the node IP changed an hour ago. Every write is compared before it is made, so a
+# converged cluster does nothing but log.
+#
+# This is also the template to copy for a git-polling CI trigger — see README §8.2.
+#
+# prune=true: deleting the directory should really remove the CronJob. Nothing it created
+# is owned by it (target registrations and patched fields survive), so there is no data to
+# lose.
+name: localstack-wiring
+namespace: localstack-wiring
+manifestPath: gitops/platform/localstack-wiring
+syncWave: "4"
+prune: "true"

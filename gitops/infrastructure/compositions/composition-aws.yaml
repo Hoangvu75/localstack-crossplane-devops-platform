@@ -1,0 +1,54 @@
+apiVersion: apiextensions.crossplane.io/v1
+kind: Composition
+metadata:
+  name: app-infra-aws
+  labels:
+    provider: aws
+spec:
+  compositeTypeRef:
+    apiVersion: devops.platform.io/v1alpha1
+    kind: XAppInfra
+  resources:
+    - name: app-s3-bucket
+      base:
+        apiVersion: s3.aws.upbound.io/v1beta1
+        kind: Bucket
+        spec:
+          forProvider:
+            forceDestroy: true
+            region: us-east-1
+            tags:
+              ManagedBy: Crossplane
+      patches:
+        - type: FromCompositeFieldPath
+          fromFieldPath: spec.environment
+          toFieldPath: spec.forProvider.tags.Environment
+        - type: FromCompositeFieldPath
+          fromFieldPath: metadata.name
+          toFieldPath: metadata.name
+          transforms:
+            - type: string
+              string:
+                fmt: "%s-bucket"
+    - name: app-ecr-repo
+      base:
+        apiVersion: ecr.aws.upbound.io/v1beta1
+        kind: Repository
+        spec:
+          forProvider:
+            forceDelete: true
+            imageTagMutability: MUTABLE
+            region: us-east-1
+            tags:
+              ManagedBy: Crossplane
+      patches:
+        - type: FromCompositeFieldPath
+          fromFieldPath: spec.environment
+          toFieldPath: spec.forProvider.tags.Environment
+        - type: FromCompositeFieldPath
+          fromFieldPath: metadata.name
+          toFieldPath: metadata.name
+          transforms:
+            - type: string
+              string:
+                fmt: "%s-repo"

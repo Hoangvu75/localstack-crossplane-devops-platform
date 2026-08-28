@@ -1,0 +1,15 @@
+apiVersion: devops.platform.io/v1alpha1
+kind: AppInfra
+metadata:
+  name: sample-microservice-infra
+  namespace: default
+spec:
+  # Without one of compositionRef / compositionSelector on the claim, or
+  # defaultCompositionRef on the XRD, Crossplane has nothing to select and the claim sits
+  # unbound with no composed resources. Having exactly one matching Composition in the
+  # cluster is not enough — selection is explicit by design, so that adding a second
+  # Composition later cannot silently re-point existing claims.
+  compositionRef:
+    name: app-infra-aws
+  environment: dev
+  region: us-east-1

@@ -1,0 +1,56 @@
+# `region` is REQUIRED on both kinds below, even though Route53 itself is a global
+# service. The CRD marks spec.forProvider.region required and the API server rejects the
+# object without it — that is why these two resources never appeared while every VPC and
+# bucket in this repo created fine: the manifests were never admitted in the first place.
+apiVersion: route53.aws.upbound.io/v1beta1
+kind: Zone
+metadata:
+  name: learn-crossplane-zone
+  labels:
+    component: r53
+spec:
+  forProvider:
+    region: us-east-1
+    name: learn-crossplane.internal
+    tags:
+      Name: learn-crossplane-zone
+      Environment: dev
+---
+apiVersion: route53.aws.upbound.io/v1beta1
+kind: Record
+metadata:
+  name: learn-crossplane-record
+spec:
+  forProvider:
+    region: us-east-1
+    name: www.learn-crossplane.internal
+    type: A
+    zoneIdSelector:
+      matchLabels:
+        component: r53
+    # ── Both values below are placeholders the localstack-wiring CronJob overwrites ──
+    #
+    # An alias record needs the target's DNS NAME and the target's CANONICAL HOSTED ZONE
+    # ID. Neither is knowable at commit time, and unlike `zoneId` above, `alias.name` has
+    # no nameRef/nameSelector in the CRD — elbv2 LB is simply not wired as a reference
+    # target for cloudfront/route53. This is the one place Crossplane is strictly weaker
+    # than the OpenTofu version of this lab, where `aws_lb.main.dns_name` just works.
+    #
+    # What was here before was wrong twice: `name: learn-crossplane-alb` is a Kubernetes
+    # resource name, not a DNS name, and `zoneId: Z2FDTNDATAQYW2` is CloudFront's fixed
+    # hosted zone, not an ALB's (us-east-1 ALBs are Z35SXDOTRQ7X7K, and LocalStack
+    # invents its own anyway).
+    #
+    # gitops/platform/localstack-wiring/ reads .status.atProvider.dnsName and .zoneId off
+    # the LB managed resource and patches them in every two minutes. The appset lists
+    # both paths under ignoreDifferences so ArgoCD selfHeal does not immediately revert
+    # the patch back to these placeholders.
+    #
+    # Fully declarative alternative, if you want it later: pull LB + Distribution +
+    # Record into one Composition and hop the value through the composite with
+    # ToCompositeFieldPath -> FromCompositeFieldPath. That is the idiomatic Crossplane
+    # answer to "resource B needs a runtime value from resource A".
+    alias:
+      - evaluateTargetHealth: false
+        name: placeholder.elb.localhost.localstack.cloud
+        zoneId: Z35SXDOTRQ7X7K

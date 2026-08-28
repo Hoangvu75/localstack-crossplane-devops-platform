@@ -1,0 +1,46 @@
+# ── What was here before, and why it could never work ────────────────────────
+# Two host-based rules: tekton.localhost.localstack.cloud for the Dashboard and
+# webhook.localhost.localstack.cloud for the EventListener, both expected to be reached on
+# :4566. Neither did anything.
+#
+# LocalStack's gateway on 4566 routes by matching the Host header against ITS OWN static
+# hostname patterns for emulated services. It has no knowledge of an Ingress inside the
+# k3d cluster, so an invented *.localhost.localstack.cloud name resolves to the gateway
+# and stops there. The OpenTofu lab hit the identical wall and wrote it down (README §6.3:
+# "Gateway routes by static hostname pattern rather than Route53 records").
+#
+# The only two ways into this cluster from the host are:
+#   1. kubectl port-forward           — how the Dashboard is reached. See README §5.
+#   2. the ALB, on http://<alb-dns>:4566 — the ALB target group forwards to the
+#      ingress-nginx NodePort 30080, so any PATH rule on a host-less Ingress is reachable
+#      that way. That is what the rule below uses.
+#
+# The Dashboard is intentionally NOT exposed here: it serves its assets from / and would
+# need a base-href rewrite to live under a subpath, while the host-less `/` catch-all is
+# already taken by the web app in gitops/workloads/_shared/ingress.yaml. port-forward is
+# the honest answer for a browser UI in this lab.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tekton-webhook
+  namespace: tekton-pipelines
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    # The EventListener serves the webhook at /, so strip the prefix. Safe to apply
+    # bluntly because this Ingress exposes exactly one endpoint.
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  ingressClassName: nginx
+  rules:
+    # No host, matching the pattern used by the app Ingress: requests arrive with several
+    # different Host headers (ALB DNS, CloudFront domain) and all must route the same way.
+    # The path is more specific than the app's `/`, so nginx prefers it.
+    - http:
+        paths:
+          - path: /tekton-webhook
+            pathType: Prefix
+            backend:
+              service:
+                name: el-ci-webhook-listener
+                port:
+                  number: 8080

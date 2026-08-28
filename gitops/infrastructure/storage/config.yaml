@@ -1,0 +1,5 @@
+name: iac-storage
+namespace: crossplane-system
+manifestPath: gitops/infrastructure/storage
+syncWave: "2"
+prune: "true"

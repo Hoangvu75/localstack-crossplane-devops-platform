@@ -1,0 +1,5 @@
+name: platform-tekton
+namespace: tekton-pipelines
+manifestPath: gitops/platform/tekton
+syncWave: "8"
+prune: "true"

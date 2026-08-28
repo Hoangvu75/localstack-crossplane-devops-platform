@@ -1,0 +1,13 @@
+apiVersion: ec2.aws.upbound.io/v1beta1
+kind: InternetGateway
+metadata:
+  name: learn-crossplane-igw
+spec:
+  forProvider:
+    region: us-east-1
+    vpcIdSelector:
+      matchLabels:
+        environment: dev
+    tags:
+      Name: learn-crossplane-igw
+      Environment: dev

@@ -1,0 +1,5 @@
+name: iac-iam
+namespace: crossplane-system
+manifestPath: gitops/infrastructure/iam
+syncWave: "1"
+prune: "true"

@@ -1,0 +1,17 @@
+# Crossplane engine plumbing: the Upbound provider packages, their credentials Secret,
+# and the ProviderConfig that points every one of them at LocalStack.
+#
+# Step 02 applies this same directory imperatively, because of a bootstrap ordering
+# problem: the providers must be Healthy before ArgoCD exists, or the Applications for
+# networking/storage/registry find no CRDs to sync against. Having ArgoCD adopt the
+# directory afterwards is still worth it — it is what makes `kubectl delete providerconfig
+# default` self-heal instead of quietly breaking every managed resource in the cluster.
+#
+# prune=false: pruning the providers takes down the entire IaC control plane, and unlike a
+# workload that would be an unrecoverable-looking failure (managed resources orphaned,
+# nothing reconciling, no error pointing here).
+name: iac-provider
+namespace: crossplane-system
+manifestPath: gitops/infrastructure/provider
+syncWave: "1"
+prune: "false"

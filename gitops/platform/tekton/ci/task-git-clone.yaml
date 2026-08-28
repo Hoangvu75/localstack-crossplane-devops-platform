@@ -1,0 +1,75 @@
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: git-clone
+  namespace: tekton-pipelines
+spec:
+  description: Clones a git repository into the shared workspace at a branch, tag, or commit SHA.
+  workspaces:
+    - name: output
+  params:
+    - name: url
+      type: string
+      description: Repository URL to clone.
+    - name: revision
+      type: string
+      default: main
+      description: Git revision to check out — a branch name, a tag, or a full commit SHA.
+    - name: depth
+      type: string
+      default: "1"
+      description: Depth of the clone. Ignored when revision is a commit SHA.
+  results:
+    - name: commit
+      description: The full SHA actually checked out.
+  steps:
+    - name: clone
+      image: alpine/git:v2.43.0
+      workingDir: $(workspaces.output.path)
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+
+        REV="$(params.revision)"
+
+        echo ">>> Cleaning workspace directory..."
+        rm -rf ./* ./.git 2>/dev/null || true
+
+        # ── Why this is not one `git clone --branch` call ────────────────────
+        # It used to be:  git clone --depth 1 --branch "$REV" "$URL" .
+        # `--branch` accepts a branch or a tag and NOTHING else. The TriggerBinding feeds
+        # this task $(body.head_commit.id) — a 40-character SHA — so every single
+        # webhook-driven run died at the first step with
+        #     warning: Could not find remote branch <sha> to clone
+        #     fatal: Remote branch <sha> not found in upstream origin
+        # while pipelinerun-manual.yaml, which passes "main", worked fine. That is why the
+        # pipeline looked healthy in manual testing and never once ran from a push.
+        #
+        # A SHA has to be fetched explicitly and checked out as FETCH_HEAD. Detecting the
+        # shape of the revision is cheaper and less surprising than trying both.
+        if echo "$REV" | grep -Eq '^[0-9a-f]{7,40}$'; then
+          echo ">>> Revision looks like a commit SHA. Fetching it directly..."
+          git init -q .
+          git remote add origin "$(params.url)"
+          # No --depth here: a shallow fetch of an arbitrary SHA needs
+          # uploadpack.allowReachableSHA1InWant on the server, which GitHub does not
+          # enable. Fetching the ref unshallowed is slower but always works.
+          git fetch -q origin "$REV"
+          git checkout -q FETCH_HEAD
+        else
+          echo ">>> Revision looks like a branch or tag. Cloning at depth $(params.depth)..."
+          git clone -q --depth "$(params.depth)" --branch "$REV" "$(params.url)" .
+          # A depth-1 clone has no history, and `git push` from one is refused by some
+          # servers ("shallow update not allowed"). The git-update-workloads task pushes,
+          # so unshallow now while the remote is already configured.
+          git fetch -q --unshallow origin || true
+        fi
+
+        COMMIT_SHA=$(git rev-parse HEAD)
+        echo ">>> Checked out: ${COMMIT_SHA}"
+
+        # Written to the workspace as well as to a Tekton result: later steps read the file
+        # (simplest thing that works across tasks sharing a PVC), and the result makes the
+        # SHA visible in `tkn pipelinerun describe` and the Dashboard.
+        printf '%s' "${COMMIT_SHA}" > commit_sha.txt
+        printf '%s' "${COMMIT_SHA}" > "$(results.commit.path)"

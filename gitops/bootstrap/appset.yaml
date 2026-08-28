@@ -1,0 +1,133 @@
+# The ONE file step 03 applies by hand. Everything else in gitops/ is discovered from here.
+#
+# Adding an infrastructure module, a platform component, or a service is: create a
+# directory and a five-line config.yaml. No script edit, no hand-written Application.
+#
+# Declared sync-wave order:
+#   0   ingress-nginx                       12  redpanda
+#   1   provider · iam · compositions       15  otel-operator
+#   2   networking · storage · registry     22  signoz
+#       · loadbalancer                      24  otel-collector
+#   3   cdn-dns                             30  _shared
+#   5   cert-manager                        35  each service
+#   8   tekton
+#
+# ── Read this before trusting those waves ────────────────────────────────────
+# `argocd.argoproj.io/sync-wave` on an Application only orders anything when a PARENT
+# application syncs it (the app-of-apps pattern). The ApplicationSet controller creates
+# all of these Applications directly, so nothing sequences them: every wave starts at
+# once and the numbers above are documentation of INTENT, not a guarantee.
+#
+# It converges anyway, and the retry block below is why — an Application whose CRDs do
+# not exist yet fails, backs off, and succeeds on a later attempt. What makes that safe
+# here is that steps 02 and 03 run in order: Crossplane and its providers are already
+# Healthy before ArgoCD exists, so the infrastructure Applications find their CRDs on the
+# first try. Waves inside a single Application (resources in one directory) DO work
+# normally.
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: learn-crossplane
+  namespace: argocd
+spec:
+  # go-template allows `{{ .name }}` and, more usefully, errors on a missing field
+  # instead of substituting an empty string.
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+
+  # false = removing a config.yaml really deletes its resources. Git is the source of
+  # truth for deletion too.
+  #
+  # The risk to know about: if the generator ever returns an EMPTY list — repo
+  # unreachable, token expired, a wrong path — ArgoCD deletes everything. The main guard
+  # is that the field below is `manifestPath`, not `path`: `path` is a RESERVED key of
+  # the git files generator, which injects its own object and overrides whatever you
+  # declare. The symptom is Applications sitting at SYNC: Unknown while HEALTH stays
+  # Healthy, deploying nothing, with no error anywhere.
+  syncPolicy:
+    preserveResourcesOnDeletion: false
+
+  generators:
+    - git:
+        repoURL: https://github.com/Hoangvu75/localstack-crossplane-devops-platform.git
+        revision: main
+        files:
+          - path: "gitops/infrastructure/*/config.yaml"
+          - path: "gitops/platform/*/config.yaml"
+          - path: "gitops/workloads/*/config.yaml"
+
+  template:
+    metadata:
+      name: "{{ .name }}"
+      annotations:
+        argocd.argoproj.io/sync-wave: "{{ .syncWave }}"
+        # ArgoCD's default text diff cannot converge on Helm-rendered manifests: charts
+        # emit empty fields (priorityClassName: "", args: null, resources.limits: {})
+        # that Kubernetes strips on write, so git has them and the cluster does not —
+        # OutOfSync forever. ServerSideDiff asks the API server to dry-run the apply and
+        # compares the PREDICTED result, which drops empty fields on both sides.
+        argocd.argoproj.io/compare-options: ServerSideDiff=true
+    spec:
+      project: default
+      ignoreDifferences:
+        # LocalStack and the API server normalise these back, so they would diff forever.
+        - group: apps
+          kind: StatefulSet
+          jqPathExpressions:
+            - '.spec.volumeClaimTemplates[]?.apiVersion'
+            - '.spec.volumeClaimTemplates[]?.kind'
+            - '.spec.template.spec.containers[]?.env[]?.valueFrom?.resourceFieldRef?.divisor'
+        - group: apps
+          kind: Deployment
+          jqPathExpressions:
+            - '.spec.template.spec.containers[]?.env[]?.valueFrom?.resourceFieldRef?.divisor'
+        # ── Fields owned by the localstack-wiring CronJob, not by git ───────────
+        # An ALB's DNS name and canonical hosted zone id only exist after the load
+        # balancer is created, and neither cloudfront Distribution.origin[].domainName
+        # nor route53 Record.alias[].name has a reference helper pointing at elbv2 LB.
+        # The localstack-wiring CronJob reads them off the LB status and patches them
+        # in, every two minutes.
+        #
+        # Without these two entries selfHeal notices the drift on the next reconcile and
+        # writes the git placeholders straight back, so CloudFront would flap between a
+        # working origin and placeholder.elb.localhost.localstack.cloud forever. That is
+        # far more confusing than a plain failure.
+        - group: cloudfront.aws.upbound.io
+          kind: Distribution
+          jqPathExpressions:
+            - '.spec.forProvider.origin[]?.domainName'
+        - group: route53.aws.upbound.io
+          kind: Record
+          jqPathExpressions:
+            - '.spec.forProvider.alias[]?.name'
+            - '.spec.forProvider.alias[]?.zoneId'
+      source:
+        repoURL: https://github.com/Hoangvu75/localstack-crossplane-devops-platform.git
+        targetRevision: main
+        path: "{{ .manifestPath }}"
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: "{{ .namespace }}"
+      syncPolicy:
+        automated:
+          selfHeal: true
+          # Overridden per component by templatePatch below.
+          prune: false
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 10s
+            factor: 2
+            maxDuration: 3m
+
+  # prune is a BOOLEAN, and config.yaml holds it as a string. Writing `prune: {{ .prune }}`
+  # inside the template above produces `prune: "true"` and the manifest fails to parse.
+  # templatePatch is rendered as text before the merge, so the quotes disappear.
+  templatePatch: |
+    spec:
+      syncPolicy:
+        automated:
+          prune: {{ .prune }}

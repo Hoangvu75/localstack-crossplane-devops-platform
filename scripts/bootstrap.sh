@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# The whole imperative bootstrap, in one readable sequence. Idempotent: safe to re-run at
+# any point, and re-running is the recovery path when a step failed halfway.
+#
+# ── Why these steps and no others ────────────────────────────────────────────
+# Everything here exists because of a chicken-and-egg problem, not convenience. The test
+# applied to each: could a controller already running in the cluster do this instead? If
+# yes, it belongs in gitops/ and it is not here.
+#
+#   1. Cluster           nothing can run in-cluster before a cluster exists
+#   2. Crossplane        the IaC engine; an engine cannot reconcile its own installation
+#   3. Providers         the ProviderConfig CRD ships INSIDE the provider package, so a
+#                        GitOps sync of it races the package install. ArgoCD also manages
+#                        this directory afterwards (gitops/infrastructure/provider), which
+#                        is what gives it self-heal — this run is only the cold start.
+#   4. ArgoCD            the bootstrap paradox: ArgoCD cannot sync its own installation
+#   5. git-credentials   a token in git is a token published
+#   6. ApplicationSet    the single handover point; after this, git is in charge
+#
+# What is deliberately NOT here any more: ALB target registration and the CloudFront and
+# Route53 wiring. Both need runtime values, both used to be one-shot host scripts you had
+# to remember to re-run, and both are now a CronJob declared in
+# gitops/platform/localstack-wiring/ that reconciles them on a two-minute loop.
+. "$(dirname "$0")/lib.sh"
+
+require_tool docker aws kubectl helm
+
+CROSSPLANE_VERSION="1.16.0"
+
+echo "=============================================================="
+echo " Bootstrapping ${PROJECT_NAME}"
+echo "=============================================================="
+
+# ── 1. LocalStack and the EKS cluster ────────────────────────────────────────
+echo ""
+echo ">>> [1/6] LocalStack and the EKS cluster"
+
+docker compose up -d localstack
+
+echo "    waiting for the eks service to report available..."
+wait_localstack eks
+
+if aws_ eks describe-cluster --name "$CLUSTER_NAME" >/dev/null 2>&1; then
+  echo "    cluster ${CLUSTER_NAME} already exists"
+else
+  echo "    creating cluster ${CLUSTER_NAME}..."
+  aws_ eks create-cluster \
+    --name "$CLUSTER_NAME" \
+    --role-arn "arn:aws:iam::000000000000:role/eks-cluster-role" \
+    --resources-vpc-config subnetIds=subnet-mock-1,subnet-mock-2 >/dev/null
+  echo "    waiting for ACTIVE (LocalStack starts a k3d cluster)..."
+  aws_ eks wait cluster-active --name "$CLUSTER_NAME"
+fi
+
+aws_ eks update-kubeconfig --name "$CLUSTER_NAME" >/dev/null
+CLUSTER_ARN=$(aws_ eks describe-cluster --name "$CLUSTER_NAME" --query 'cluster.arn' --output text)
+
+# The reported endpoint is addressed for the Docker network and carries a CA bundle for a
+# certificate the host does not trust. From the host the API server is on a published port.
+#
+# The port is read rather than hardcoded: LocalStack allocates external ports from the
+# 4510-4559 range, and 4510 is only the one it usually hands out first. The OpenTofu lab
+# hardcoded 4510 and got away with it, right up until a second Pro service takes it.
+CLUSTER_ENDPOINT=$(aws_ eks describe-cluster --name "$CLUSTER_NAME" --query 'cluster.endpoint' --output text)
+API_PORT=$(echo "$CLUSTER_ENDPOINT" | sed -nE 's|.*:([0-9]+)/?$|\1|p')
+API_PORT="${API_PORT:-4510}"
+echo "    api server: ${CLUSTER_ENDPOINT} maps to https://127.0.0.1:${API_PORT} from the host"
+
+kubectl config set-cluster "$CLUSTER_ARN" \
+  --server="https://127.0.0.1:${API_PORT}" \
+  --insecure-skip-tls-verify=true >/dev/null
+# Leaving the CA bundle alongside --insecure-skip-tls-verify makes kubectl refuse to run:
+# "specifying a root certificates file with the insecure flag is not allowed".
+kubectl config unset "clusters.${CLUSTER_ARN}.certificate-authority-data" >/dev/null 2>&1 || true
+
+if ! kubectl wait --for=condition=Ready nodes --all --timeout=300s >/dev/null; then
+  echo "ERROR: no node reached Ready. Check 'docker ps' for the k3d containers and" >&2
+  echo "       'kubectl cluster-info' for reachability of https://127.0.0.1:${API_PORT}." >&2
+  exit 1
+fi
+echo "    nodes ready"
+
+# ── 2. Crossplane ────────────────────────────────────────────────────────────
+echo ""
+echo ">>> [2/6] Crossplane ${CROSSPLANE_VERSION}"
+
+# ── Why the version is pinned ────────────────────────────────────────────────
+# Unpinned, the chart resolves to the latest, which is now v2.x. Crossplane v2 REMOVED
+# native patch-and-transform Composition, and
+# gitops/infrastructure/compositions/composition-aws.yaml uses spec.resources, so it would
+# be rejected outright. v1.17 deprecated it, v2.0 deleted it.
+#
+# 1.16.0 is the last release where spec.resources is fully supported. To move to v2, both
+# halves have to happen together:
+#   1. crossplane beta convert pipeline-composition \
+#        gitops/infrastructure/compositions/composition-aws.yaml -o composition-aws.yaml
+#   2. install the function it then depends on:
+#        xpkg.upbound.io/crossplane-contrib/function-patch-and-transform:v0.7.0
+helm repo add crossplane-stable https://charts.crossplane.io/stable --force-update >/dev/null 2>&1 || true
+helm repo update crossplane-stable >/dev/null
+helm upgrade --install crossplane crossplane-stable/crossplane \
+  --namespace crossplane-system --create-namespace \
+  --version "${CROSSPLANE_VERSION}" --wait --timeout 5m >/dev/null
+echo "    engine installed"
+
+# ── 3. Providers and ProviderConfig ──────────────────────────────────────────
+echo ""
+echo ">>> [3/6] Upbound AWS providers"
+
+kubectl apply -f gitops/infrastructure/provider/secret-credentials.yaml >/dev/null
+kubectl apply -f gitops/infrastructure/provider/provider-aws.yaml >/dev/null
+
+# ── Why this wait exists, and why it is not a wait on pods ───────────────────
+# provider-config.yaml declares kind ProviderConfig, whose CRD ships inside the
+# provider-family-aws package. Applying it immediately, as the old step 02 did, fails:
+#     error: resource mapping not found for kind "ProviderConfig" ...
+#     ensure CRDs are installed first
+# and set -e aborts the run. The package needs 1-3 minutes to pull from xpkg.upbound.io,
+# install a ProviderRevision, and register its CRDs.
+#
+# The old probe was wrong twice over: it ran AFTER the apply, and a provider pod reaching
+# Ready does not mean its CRDs are served. condition=Healthy on the Provider object is the
+# signal that the revision is active.
+echo "    waiting for Healthy (packages download from xpkg.upbound.io, 1-3 min)..."
+if ! kubectl wait --for=condition=Healthy provider.pkg.crossplane.io --all --timeout=600s >/dev/null; then
+  echo "ERROR: providers did not reach Healthy. Inspect with:" >&2
+  echo "  kubectl get providers.pkg.crossplane.io" >&2
+  echo "  kubectl describe provider.pkg.crossplane.io provider-family-aws" >&2
+  exit 1
+fi
+
+until kubectl get crd providerconfigs.aws.upbound.io >/dev/null 2>&1; do sleep 2; done
+kubectl wait --for=condition=Established crd/providerconfigs.aws.upbound.io --timeout=120s >/dev/null
+kubectl apply -f gitops/infrastructure/provider/provider-config.yaml >/dev/null
+
+# The four LocalStack toggles are snake_case in the CRD. In camelCase they are pruned
+# silently and every S3 call then addresses a virtual-hosted URL. Assert, do not hope.
+# The localstack-wiring CronJob re-checks this on every loop.
+TOGGLES=$(kubectl get providerconfig default -o json | grep -c 'skip_[a-z_]*": true' || true)
+if [ "${TOGGLES}" -lt 4 ]; then
+  echo "ERROR: expected 4 skip_ toggles on providerconfig/default, found ${TOGGLES}." >&2
+  echo "       They were pruned by the API server. Check for camelCase field names in" >&2
+  echo "       gitops/infrastructure/provider/provider-config.yaml." >&2
+  exit 1
+fi
+echo "    providers Healthy, ProviderConfig applied, ${TOGGLES} toggles verified"
+
+# ── 4. ArgoCD ────────────────────────────────────────────────────────────────
+echo ""
+echo ">>> [4/6] ArgoCD v2.13.2"
+
+kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+kubectl apply -n argocd -f gitops/bootstrap/argocd/install-v2.13.2.yaml >/dev/null
+kubectl -n argocd wait --for=condition=Available deployment/argocd-server --timeout=300s >/dev/null
+echo "    server available"
+
+# ── 5. The credential that connects CI to CD ─────────────────────────────────
+echo ""
+echo ">>> [5/6] git-credentials Secret"
+
+# gitops/platform/tekton/ci/task-git-update-workloads.yaml mounts a Secret named
+# git-credentials to push updated image tags back to git. Nothing created it: the name
+# appeared exactly once in the whole repository, on the line that consumed it.
+#
+# The secrets step puts the token in Secrets Manager, which is the right place, because git
+# holds no secrets. But Secrets Manager is not readable from a Tekton step without AWS
+# tooling and credentials in the pod, so the token is materialised into the cluster once,
+# here, at the only point in the lifecycle that already has both AWS access and kubectl.
+#
+# Symptom this fixes: the pipeline ran green, images reached ECR, and ArgoCD kept deploying
+# the previous tag forever, because the push step took its else branch and printed
+# "Skipping git push".
+TOKEN=$(aws_ secretsmanager get-secret-value --secret-id "$SECRET_NAME_GITHUB" \
+  --query SecretString --output text 2>/dev/null || echo "")
+
+if [ -z "$TOKEN" ] || [ "$TOKEN" = "dummy_token_for_local_testing" ]; then
+  echo "    WARNING: no usable token in Secrets Manager (${SECRET_NAME_GITHUB})." >&2
+  echo "             The Tekton git push step will fail with an explicit error until you" >&2
+  echo "             set GITHUB_TOKEN in .env and re-run: make secrets && make bootstrap" >&2
+  echo "             Everything else works." >&2
+else
+  # The namespace does not exist yet, because ArgoCD creates it when it syncs the tekton
+  # Application, so create it here rather than depending on sync ordering.
+  kubectl create namespace tekton-pipelines --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  # dry-run piped to apply rather than create secret, so re-running rotates the value
+  # instead of failing with AlreadyExists.
+  kubectl -n tekton-pipelines create secret generic git-credentials \
+    --from-literal=token="$TOKEN" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  echo "    created in tekton-pipelines (value not echoed)"
+fi
+
+# ── 6. Handover ──────────────────────────────────────────────────────────────
+echo ""
+echo ">>> [6/6] ApplicationSet, git takes over from here"
+
+kubectl apply -f gitops/bootstrap/appset.yaml >/dev/null
+APP_COUNT=$(kubectl -n argocd get applications --no-headers 2>/dev/null | wc -l | tr -d ' ')
+echo "    applied; ${APP_COUNT} Applications generated so far (more appear as the generator polls)"
+
+ADMIN_PASS=$(kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath="{.data.password}" 2>/dev/null | base64 -d 2>/dev/null || echo "N/A")
+
+cat <<INFO
+
+==============================================================
+ Bootstrap complete. Nothing else is imperative.
+==============================================================
+
+ArgoCD    kubectl -n argocd port-forward svc/argocd-server 8080:80
+          http://localhost:8080   admin / ${ADMIN_PASS}
+
+From here the cluster converges on its own. The localstack-wiring CronJob registers the
+ALB target and patches the CloudFront origin and Route53 alias every two minutes, so the
+entry URLs appear without another command.
+
+Watch it:   make status
+INFO

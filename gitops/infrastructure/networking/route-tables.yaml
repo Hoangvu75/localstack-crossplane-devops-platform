@@ -1,0 +1,61 @@
+apiVersion: ec2.aws.upbound.io/v1beta1
+kind: RouteTable
+metadata:
+  name: learn-crossplane-public-rt
+  labels:
+    type: public
+spec:
+  forProvider:
+    region: us-east-1
+    vpcIdSelector:
+      matchLabels:
+        environment: dev
+    tags:
+      Name: learn-crossplane-public-rt
+      Environment: dev
+---
+apiVersion: ec2.aws.upbound.io/v1beta1
+kind: Route
+metadata:
+  name: learn-crossplane-public-route
+spec:
+  forProvider:
+    destinationCidrBlock: 0.0.0.0/0
+    # matchControllerRef narrows the candidate set to resources composed by the SAME
+    # Composite. Everything in this directory is a standalone managed resource with no
+    # controller reference, so the selector matched nothing and the Route stayed at
+    #   "cannot resolve references: no resources matched selector"
+    # with a Synced=False condition and no other symptom. A standalone MR needs a
+    # direct reference by name.
+    gatewayIdRef:
+      name: learn-crossplane-igw
+    routeTableIdSelector:
+      matchLabels:
+        type: public
+    region: us-east-1
+---
+apiVersion: ec2.aws.upbound.io/v1beta1
+kind: RouteTableAssociation
+metadata:
+  name: learn-crossplane-public-a-assoc
+spec:
+  forProvider:
+    region: us-east-1
+    routeTableIdSelector:
+      matchLabels:
+        type: public
+    subnetIdRef:
+      name: learn-crossplane-public-a
+---
+apiVersion: ec2.aws.upbound.io/v1beta1
+kind: RouteTableAssociation
+metadata:
+  name: learn-crossplane-public-b-assoc
+spec:
+  forProvider:
+    region: us-east-1
+    routeTableIdSelector:
+      matchLabels:
+        type: public
+    subnetIdRef:
+      name: learn-crossplane-public-b

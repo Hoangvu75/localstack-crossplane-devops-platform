@@ -1,0 +1,311 @@
+apiVersion: ecr.aws.upbound.io/v1beta1
+kind: Repository
+metadata:
+  name: learn-crossplane-web-app
+spec:
+  forProvider:
+    forceDelete: true
+    imageTagMutability: MUTABLE
+    imageScanningConfiguration:
+      - scanOnPush: true
+    region: us-east-1
+    tags:
+      Name: learn-crossplane-web-app
+      Environment: dev
+      Component: registry
+---
+apiVersion: ecr.aws.upbound.io/v1beta1
+kind: LifecyclePolicy
+metadata:
+  name: learn-crossplane-web-app-policy
+spec:
+  forProvider:
+    region: us-east-1
+    repositoryRef:
+      name: learn-crossplane-web-app
+    policy: |
+      {
+        "rules": [
+          {
+            "rulePriority": 1,
+            "description": "Delete untagged images after 1 day",
+            "selection": {
+              "tagStatus": "untagged",
+              "countType": "sinceImagePushed",
+              "countUnit": "days",
+              "countNumber": 1
+            },
+            "action": { "type": "expire" }
+          },
+          {
+            "rulePriority": 2,
+            "description": "Keep latest 10 tagged images",
+            "selection": {
+              "tagStatus": "any",
+              "countType": "imageCountMoreThan",
+              "countNumber": 10
+            },
+            "action": { "type": "expire" }
+          }
+        ]
+      }
+---
+apiVersion: ecr.aws.upbound.io/v1beta1
+kind: Repository
+metadata:
+  name: learn-crossplane-cpu-service
+spec:
+  forProvider:
+    forceDelete: true
+    imageTagMutability: MUTABLE
+    imageScanningConfiguration:
+      - scanOnPush: true
+    region: us-east-1
+    tags:
+      Name: learn-crossplane-cpu-service
+      Environment: dev
+      Component: registry
+---
+apiVersion: ecr.aws.upbound.io/v1beta1
+kind: LifecyclePolicy
+metadata:
+  name: learn-crossplane-cpu-service-policy
+spec:
+  forProvider:
+    region: us-east-1
+    repositoryRef:
+      name: learn-crossplane-cpu-service
+    policy: |
+      {
+        "rules": [
+          {
+            "rulePriority": 1,
+            "description": "Delete untagged images after 1 day",
+            "selection": {
+              "tagStatus": "untagged",
+              "countType": "sinceImagePushed",
+              "countUnit": "days",
+              "countNumber": 1
+            },
+            "action": { "type": "expire" }
+          },
+          {
+            "rulePriority": 2,
+            "description": "Keep latest 10 tagged images",
+            "selection": {
+              "tagStatus": "any",
+              "countType": "imageCountMoreThan",
+              "countNumber": 10
+            },
+            "action": { "type": "expire" }
+          }
+        ]
+      }
+---
+apiVersion: ecr.aws.upbound.io/v1beta1
+kind: Repository
+metadata:
+  name: learn-crossplane-memory-service
+spec:
+  forProvider:
+    forceDelete: true
+    imageTagMutability: MUTABLE
+    imageScanningConfiguration:
+      - scanOnPush: true
+    region: us-east-1
+    tags:
+      Name: learn-crossplane-memory-service
+      Environment: dev
+      Component: registry
+---
+apiVersion: ecr.aws.upbound.io/v1beta1
+kind: LifecyclePolicy
+metadata:
+  name: learn-crossplane-memory-service-policy
+spec:
+  forProvider:
+    region: us-east-1
+    repositoryRef:
+      name: learn-crossplane-memory-service
+    policy: |
+      {
+        "rules": [
+          {
+            "rulePriority": 1,
+            "description": "Delete untagged images after 1 day",
+            "selection": {
+              "tagStatus": "untagged",
+              "countType": "sinceImagePushed",
+              "countUnit": "days",
+              "countNumber": 1
+            },
+            "action": { "type": "expire" }
+          },
+          {
+            "rulePriority": 2,
+            "description": "Keep latest 10 tagged images",
+            "selection": {
+              "tagStatus": "any",
+              "countType": "imageCountMoreThan",
+              "countNumber": 10
+            },
+            "action": { "type": "expire" }
+          }
+        ]
+      }
+---
+apiVersion: ecr.aws.upbound.io/v1beta1
+kind: Repository
+metadata:
+  name: learn-crossplane-disk-service
+spec:
+  forProvider:
+    forceDelete: true
+    imageTagMutability: MUTABLE
+    imageScanningConfiguration:
+      - scanOnPush: true
+    region: us-east-1
+    tags:
+      Name: learn-crossplane-disk-service
+      Environment: dev
+      Component: registry
+---
+apiVersion: ecr.aws.upbound.io/v1beta1
+kind: LifecyclePolicy
+metadata:
+  name: learn-crossplane-disk-service-policy
+spec:
+  forProvider:
+    region: us-east-1
+    repositoryRef:
+      name: learn-crossplane-disk-service
+    policy: |
+      {
+        "rules": [
+          {
+            "rulePriority": 1,
+            "description": "Delete untagged images after 1 day",
+            "selection": {
+              "tagStatus": "untagged",
+              "countType": "sinceImagePushed",
+              "countUnit": "days",
+              "countNumber": 1
+            },
+            "action": { "type": "expire" }
+          },
+          {
+            "rulePriority": 2,
+            "description": "Keep latest 10 tagged images",
+            "selection": {
+              "tagStatus": "any",
+              "countType": "imageCountMoreThan",
+              "countNumber": 10
+            },
+            "action": { "type": "expire" }
+          }
+        ]
+      }
+---
+apiVersion: ecr.aws.upbound.io/v1beta1
+kind: Repository
+metadata:
+  name: learn-crossplane-rest-service
+spec:
+  forProvider:
+    forceDelete: true
+    imageTagMutability: MUTABLE
+    imageScanningConfiguration:
+      - scanOnPush: true
+    region: us-east-1
+    tags:
+      Name: learn-crossplane-rest-service
+      Environment: dev
+      Component: registry
+---
+apiVersion: ecr.aws.upbound.io/v1beta1
+kind: LifecyclePolicy
+metadata:
+  name: learn-crossplane-rest-service-policy
+spec:
+  forProvider:
+    region: us-east-1
+    repositoryRef:
+      name: learn-crossplane-rest-service
+    policy: |
+      {
+        "rules": [
+          {
+            "rulePriority": 1,
+            "description": "Delete untagged images after 1 day",
+            "selection": {
+              "tagStatus": "untagged",
+              "countType": "sinceImagePushed",
+              "countUnit": "days",
+              "countNumber": 1
+            },
+            "action": { "type": "expire" }
+          },
+          {
+            "rulePriority": 2,
+            "description": "Keep latest 10 tagged images",
+            "selection": {
+              "tagStatus": "any",
+              "countType": "imageCountMoreThan",
+              "countNumber": 10
+            },
+            "action": { "type": "expire" }
+          }
+        ]
+      }
+---
+apiVersion: ecr.aws.upbound.io/v1beta1
+kind: Repository
+metadata:
+  name: learn-crossplane-history-service
+spec:
+  forProvider:
+    forceDelete: true
+    imageTagMutability: MUTABLE
+    imageScanningConfiguration:
+      - scanOnPush: true
+    region: us-east-1
+    tags:
+      Name: learn-crossplane-history-service
+      Environment: dev
+      Component: registry
+---
+apiVersion: ecr.aws.upbound.io/v1beta1
+kind: LifecyclePolicy
+metadata:
+  name: learn-crossplane-history-service-policy
+spec:
+  forProvider:
+    region: us-east-1
+    repositoryRef:
+      name: learn-crossplane-history-service
+    policy: |
+      {
+        "rules": [
+          {
+            "rulePriority": 1,
+            "description": "Delete untagged images after 1 day",
+            "selection": {
+              "tagStatus": "untagged",
+              "countType": "sinceImagePushed",
+              "countUnit": "days",
+              "countNumber": 1
+            },
+            "action": { "type": "expire" }
+          },
+          {
+            "rulePriority": 2,
+            "description": "Keep latest 10 tagged images",
+            "selection": {
+              "tagStatus": "any",
+              "countType": "imageCountMoreThan",
+              "countNumber": 10
+            },
+            "action": { "type": "expire" }
+          }
+        ]
+      }

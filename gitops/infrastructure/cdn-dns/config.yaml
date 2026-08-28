@@ -1,0 +1,5 @@
+name: iac-cdn-dns
+namespace: crossplane-system
+manifestPath: gitops/infrastructure/cdn-dns
+syncWave: "3"
+prune: "true"

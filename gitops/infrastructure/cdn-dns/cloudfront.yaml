@@ -1,0 +1,71 @@
+apiVersion: cloudfront.aws.upbound.io/v1beta1
+kind: Distribution
+metadata:
+  name: learn-crossplane-cf
+spec:
+  forProvider:
+    # Required even though CloudFront is a global service, same as on route53 Zone and
+    # Record. The CRD marks it required and the API server rejects the object without it.
+    # IAM is the exception in this repo: its CRDs have no region field at all.
+    region: us-east-1
+    enabled: true
+    isIpv6Enabled: false
+    comment: CloudFront distribution for learn-crossplane
+    defaultCacheBehavior:
+      - allowedMethods:
+          - DELETE
+          - GET
+          - HEAD
+          - OPTIONS
+          - PATCH
+          - POST
+          - PUT
+        cachedMethods:
+          - GET
+          - HEAD
+        targetOriginId: alb-origin
+        viewerProtocolPolicy: allow-all
+        forwardedValues:
+          - queryString: true
+            cookies:
+              - forward: all
+            headers:
+              - Host
+              - Authorization
+              - Origin
+    origin:
+      # ── domainName is a placeholder the localstack-wiring CronJob overwrites ──
+      #
+      # This used to read `domainNameSelector: {matchLabels: {component: alb}}`. That
+      # field does not exist: on Distribution, origin[].domainName is a plain string with
+      # no domainNameRef/domainNameSelector (only originAccessControlId has reference
+      # helpers). The API server pruned the unknown key, which left the REQUIRED
+      # domainName empty, and the Distribution was rejected by its own validation rule —
+      # so CloudFront never existed while the ALB next to it did.
+      #
+      # gitops/platform/localstack-wiring/ reads .status.atProvider.dnsName off the LB
+      # and patches it here on a two-minute loop, so it does not matter that the ALB
+      # does not exist yet when this manifest first syncs. The appset lists this field
+      # path under ignoreDifferences so selfHeal does not revert the patch.
+      #
+      # See the longer note in route53.yaml for the fully declarative alternative.
+      - domainName: placeholder.elb.localhost.localstack.cloud
+        originId: alb-origin
+        customOriginConfig:
+          # httpPort 4566, not 80: LocalStack does not bind an ALB on port 80, the
+          # gateway multiplexes every emulated endpoint on 4566. This is the same
+          # workaround the OpenTofu lab applied via `http_port = var.is_local ? 4566 : 80`
+          # and it is the first thing to change when moving to real AWS.
+          - httpPort: 4566
+            httpsPort: 443
+            originProtocolPolicy: http-only
+            originSslProtocols:
+              - TLSv1.2
+    restrictions:
+      - geoRestriction:
+          - restrictionType: none
+    viewerCertificate:
+      - cloudfrontDefaultCertificate: true
+    tags:
+      Name: learn-crossplane-cf
+      Environment: dev

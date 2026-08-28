@@ -1,0 +1,180 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: localstack-wiring-script
+  namespace: localstack-wiring
+data:
+  wire.sh: |
+    #!/usr/bin/env sh
+    set -eu
+
+    PROJECT="${PROJECT_NAME}"
+    ALB_MR="${PROJECT}-alb"
+    TG_NAME="${PROJECT}-tg-ip"
+    CF_MR="${PROJECT}-cf"
+    REC_MR="${PROJECT}-record"
+
+    echo "=== localstack-wiring $(date -u +%H:%M:%SZ) ==="
+
+    # ── 0. Health assertion, not wiring ─────────────────────────────────────
+    # The Upbound ProviderConfig CRD names its LocalStack toggles in snake_case. In
+    # camelCase the API server prunes them silently, and the only visible effect is S3
+    # failing much later against a virtual-hosted URL. Asserted on every loop because
+    # this is the failure that looks like anything except its cause.
+    TOGGLES=$(kubectl get providerconfig default -o json 2>/dev/null | grep -c 'skip_[a-z_]*": true' || true)
+    if [ "${TOGGLES:-0}" -lt 4 ]; then
+      echo "WARNING: providerconfig/default has ${TOGGLES:-0} skip_ toggles, expected 4."
+      echo "         They were pruned by the API server. Check for camelCase field names"
+      echo "         in gitops/infrastructure/provider/provider-config.yaml."
+    fi
+
+    # ── 1. ALB target group membership ──────────────────────────────────────
+    NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || echo "")
+    TG_ARN=$(aws elbv2 describe-target-groups --names "${TG_NAME}" --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null || echo "")
+
+    if [ -z "${TG_ARN}" ] || [ "${TG_ARN}" = "None" ]; then
+      echo "target group ${TG_NAME} does not exist yet, Crossplane still reconciling"
+    elif [ -z "${NODE_IP}" ]; then
+      echo "WARNING: could not read the node InternalIP"
+    else
+      CURRENT=$(aws elbv2 describe-target-health --target-group-arn "${TG_ARN}" --query 'TargetHealthDescriptions[].Target.Id' --output text 2>/dev/null || echo "")
+      # Compared before writing so a converged cluster makes no write calls. Registering
+      # an already-registered target is harmless, but it makes the log useless for
+      # spotting the moment a node IP actually changed.
+      if echo " ${CURRENT} " | grep -Fq " ${NODE_IP} "; then
+        echo "target ${NODE_IP}:30080 already registered"
+      else
+        aws elbv2 register-targets --target-group-arn "${TG_ARN}" --targets "Id=${NODE_IP},Port=30080"
+        echo "registered ${NODE_IP}:30080 (previous: ${CURRENT:-none})"
+      fi
+    fi
+
+    # ── 2. CloudFront origin and Route53 alias ──────────────────────────────
+    ALB_DNS=$(kubectl get lb.elbv2.aws.upbound.io "${ALB_MR}" -o jsonpath='{.status.atProvider.dnsName}' 2>/dev/null || echo "")
+
+    if [ -z "${ALB_DNS}" ]; then
+      echo "ALB reports no dnsName in .status.atProvider yet, nothing to wire"
+      echo "=== done ==="
+      exit 0
+    fi
+
+    # LocalStack does not always report a canonical hosted zone id. The real us-east-1
+    # value is the correct fallback and is inert locally either way.
+    ALB_ZONE=$(kubectl get lb.elbv2.aws.upbound.io "${ALB_MR}" -o jsonpath='{.status.atProvider.zoneId}' 2>/dev/null || echo "")
+    ALB_ZONE="${ALB_ZONE:-Z35SXDOTRQ7X7K}"
+
+    CUR_ORIGIN=$(kubectl get distribution.cloudfront.aws.upbound.io "${CF_MR}" -o jsonpath='{.spec.forProvider.origin[0].domainName}' 2>/dev/null || echo "")
+    if [ "${CUR_ORIGIN}" = "${ALB_DNS}" ]; then
+      echo "cloudfront origin already ${ALB_DNS}"
+    else
+      # A merge patch replaces a list wholesale, so the whole origin entry is restated.
+      # httpPort stays 4566: LocalStack binds nothing on 80 and multiplexes every
+      # emulated endpoint behind its gateway port.
+      #
+      # printf builds the JSON so the patch body carries no escaped quotes. Inline
+      # escaping inside a YAML block scalar inside a ConfigMap is three levels of quoting
+      # and gets corrupted by the first tool that reformats the file.
+      ORIGIN_PATCH=$(printf '{"spec":{"forProvider":{"origin":[{"domainName":"%s","originId":"alb-origin","customOriginConfig":[{"httpPort":4566,"httpsPort":443,"originProtocolPolicy":"http-only","originSslProtocols":["TLSv1.2"]}]}]}}}' "${ALB_DNS}")
+      kubectl patch distribution.cloudfront.aws.upbound.io "${CF_MR}" --type=merge -p "${ORIGIN_PATCH}"
+      echo "patched cloudfront origin: ${CUR_ORIGIN:-unset} -> ${ALB_DNS}"
+    fi
+
+    CUR_ALIAS=$(kubectl get record.route53.aws.upbound.io "${REC_MR}" -o jsonpath='{.spec.forProvider.alias[0].name}' 2>/dev/null || echo "")
+    if [ "${CUR_ALIAS}" = "${ALB_DNS}" ]; then
+      echo "route53 alias already ${ALB_DNS}"
+    else
+      ALIAS_PATCH=$(printf '{"spec":{"forProvider":{"alias":[{"evaluateTargetHealth":false,"name":"%s","zoneId":"%s"}]}}}' "${ALB_DNS}" "${ALB_ZONE}")
+      kubectl patch record.route53.aws.upbound.io "${REC_MR}" --type=merge -p "${ALIAS_PATCH}"
+      echo "patched route53 alias: ${CUR_ALIAS:-unset} -> ${ALB_DNS}"
+    fi
+
+    # Printed every loop so `make status`, which tails this log, always has the current
+    # entry URLs without querying anything itself.
+    CF_DOMAIN=$(kubectl get distribution.cloudfront.aws.upbound.io "${CF_MR}" -o jsonpath='{.status.atProvider.domainName}' 2>/dev/null || echo "")
+    echo "ENDPOINT ALB        http://${ALB_DNS}:4566/"
+    if [ -n "${CF_DOMAIN}" ]; then
+      echo "ENDPOINT CloudFront http://${CF_DOMAIN}:4566/"
+    fi
+    echo "ENDPOINT Webhook    http://${ALB_DNS}:4566/tekton-webhook  (POST only)"
+    echo "=== done ==="
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: localstack-wiring
+  namespace: localstack-wiring
+  labels:
+    app: localstack-wiring
+spec:
+  # Two minutes is a compromise: fast enough that a cluster recreation heals before you
+  # finish reading `make status`, slow enough that the log stays readable. Every write is
+  # compared first, so a converged run costs four read-only API calls and nothing else.
+  schedule: "*/2 * * * *"
+  # Forbid, not Replace: a run still going is in the middle of an AWS write, and killing
+  # it mid-patch is worse than skipping a cycle.
+  concurrencyPolicy: Forbid
+  # Keep the last success, which is what `make status` reads, and two failures.
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 2
+  # Without this a cluster suspended overnight wakes up and runs every missed schedule.
+  startingDeadlineSeconds: 120
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      # The next schedule is two minutes away, so a stuck pod should die rather than block
+      # the CronJob under concurrencyPolicy: Forbid.
+      activeDeadlineSeconds: 300
+      template:
+        metadata:
+          labels:
+            app: localstack-wiring
+        spec:
+          serviceAccountName: localstack-wiring
+          restartPolicy: Never
+          containers:
+            - name: wire
+              # The same image the Tekton git task uses: carries kubectl and the AWS CLI,
+              # so nothing is installed at runtime.
+              image: alpine/k8s:1.28.2
+              command: ["/bin/sh", "/opt/wiring/wire.sh"]
+              env:
+                - name: PROJECT_NAME
+                  value: learn-crossplane
+                # In-cluster address. The host uses http://localhost:4566; this pod runs on
+                # the k3d network where the compose service name resolves.
+                - name: AWS_ENDPOINT_URL
+                  value: http://localstack:4566
+                - name: AWS_DEFAULT_REGION
+                  value: us-east-1
+                # Deliberately literal, not a Secret. LocalStack accepts any credential and
+                # these are worthless anywhere else, so a Secret would imply a protection
+                # that does not exist. On real AWS this becomes IRSA and both lines
+                # disappear — README §7.
+                - name: AWS_ACCESS_KEY_ID
+                  value: mock_access_key
+                - name: AWS_SECRET_ACCESS_KEY
+                  value: mock_secret_key
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests:
+                  cpu: 20m
+                  memory: 64Mi
+                limits:
+                  cpu: 200m
+                  memory: 256Mi
+              volumeMounts:
+                - name: script
+                  mountPath: /opt/wiring
+                # readOnlyRootFilesystem is set, and the AWS CLI writes here.
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: script
+              configMap:
+                name: localstack-wiring-script
+            - name: tmp
+              emptyDir: {}

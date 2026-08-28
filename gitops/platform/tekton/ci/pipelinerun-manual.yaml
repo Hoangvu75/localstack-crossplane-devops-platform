@@ -1,0 +1,31 @@
+apiVersion: tekton.dev/v1beta1
+kind: PipelineRun
+metadata:
+  generateName: manual-monorepo-ci-run-
+  namespace: tekton-pipelines
+  labels:
+    tekton.dev/pipeline: monorepo-ci-pipeline
+spec:
+  pipelineRef:
+    name: monorepo-ci-pipeline
+  # A wedged dind step otherwise holds the workspace PVC until the cluster-wide default.
+  timeouts:
+    pipeline: "45m"
+  params:
+    - name: repoUrl
+      value: "https://github.com/Hoangvu75/localstack-crossplane-devops-platform.git"
+    - name: gitRevision
+      value: "main"
+    - name: registryHost
+      value: "000000000000.dkr.ecr.us-east-1.localhost.localstack.cloud:4566"
+    - name: projectName
+      value: "learn-crossplane"
+  workspaces:
+    - name: shared-data
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 2Gi

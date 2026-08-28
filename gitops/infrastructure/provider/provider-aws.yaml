@@ -1,0 +1,66 @@
+# Upbound AWS providers, one package per service family.
+#
+# provider-family-aws is NOT optional: it owns the ProviderConfig CRD that every other
+# package below depends on. It is also why step 02 must wait for Healthy before applying
+# provider-config.yaml — the CRD does not exist until this package finishes installing.
+#
+# Only the families actually referenced by a manifest in gitops/infrastructure/ are listed.
+# Each package is a separate Deployment with its own controller and memory footprint, so
+# provider-aws-codebuild (replaced by Tekton) and provider-aws-secretsmanager (the GitHub
+# token is read with the aws CLI in step 03, not reconciled) were removed. Add a family back
+# the same day you add a manifest that needs it, not before.
+apiVersion: pkg.crossplane.io/v1
+kind: Provider
+metadata:
+  name: provider-family-aws
+spec:
+  package: xpkg.upbound.io/upbound/provider-family-aws:v1.14.0
+---
+apiVersion: pkg.crossplane.io/v1
+kind: Provider
+metadata:
+  name: provider-aws-s3
+spec:
+  package: xpkg.upbound.io/upbound/provider-aws-s3:v1.14.0
+---
+apiVersion: pkg.crossplane.io/v1
+kind: Provider
+metadata:
+  name: provider-aws-ecr
+spec:
+  package: xpkg.upbound.io/upbound/provider-aws-ecr:v1.14.0
+---
+apiVersion: pkg.crossplane.io/v1
+kind: Provider
+metadata:
+  name: provider-aws-ec2
+spec:
+  package: xpkg.upbound.io/upbound/provider-aws-ec2:v1.14.0
+---
+apiVersion: pkg.crossplane.io/v1
+kind: Provider
+metadata:
+  name: provider-aws-elbv2
+spec:
+  package: xpkg.upbound.io/upbound/provider-aws-elbv2:v1.14.0
+---
+apiVersion: pkg.crossplane.io/v1
+kind: Provider
+metadata:
+  name: provider-aws-iam
+spec:
+  package: xpkg.upbound.io/upbound/provider-aws-iam:v1.14.0
+---
+apiVersion: pkg.crossplane.io/v1
+kind: Provider
+metadata:
+  name: provider-aws-cloudfront
+spec:
+  package: xpkg.upbound.io/upbound/provider-aws-cloudfront:v1.14.0
+---
+apiVersion: pkg.crossplane.io/v1
+kind: Provider
+metadata:
+  name: provider-aws-route53
+spec:
+  package: xpkg.upbound.io/upbound/provider-aws-route53:v1.14.0

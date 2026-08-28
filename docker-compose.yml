@@ -1,0 +1,41 @@
+services:
+  localstack:
+    image: localstack/localstack-pro:latest
+    container_name: localstack
+    restart: unless-stopped
+    ports:
+      - "4566:4566"
+      - "4510-4559:4510-4559"  # external services port range (EKS API, ECR, etc.)
+    environment:
+      - DEBUG=1
+      - LOCALSTACK_AUTH_TOKEN=${LOCALSTACK_PAT:-}
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      # Retain emulated resources across restarts, saved to ./data/localstack volume.
+      - PERSISTENCE=1
+      # Disable CSRF mitigation to allow frontend web apps to load static assets seamlessly
+      - DISABLE_CORS_CHECKS=1
+      # Force external CDN/Registry domains to resolve via real upstream DNS to avoid x509 cert issues
+      - DNS_NAME_PATTERNS_TO_RESOLVE_UPSTREAM=.*cloudfront\.net,.*\.pkg\.dev,.*registry\.k8s\.io,.*quay\.io,.*ghcr\.io,.*docker\.io,.*docker\.com,.*githubusercontent\.com,.*github\.com,.*\.azureedge\.net,.*blob\.core\.windows\.net
+    env_file:
+      - .env
+    volumes:
+      - ./data/localstack:/var/lib/localstack
+      - //var/run/docker.sock:/var/run/docker.sock
+
+  # Optional local devops-tools runner container equipped with awscli, kubectl, helm
+  devops-runner:
+    image: alpine/k8s:1.28.2
+    container_name: devops-runner
+    restart: "no"
+    profiles: ["tools"]
+    environment:
+      - AWS_ENDPOINT_URL=http://localstack:4566
+      - AWS_DEFAULT_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=mock_access_key
+      - AWS_SECRET_ACCESS_KEY=mock_secret_key
+    volumes:
+      - ./:/workspace
+      - //var/run/docker.sock:/var/run/docker.sock
+    working_dir: /workspace
+    depends_on:
+      - localstack
