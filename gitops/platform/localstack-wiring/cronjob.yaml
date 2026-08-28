@@ -70,7 +70,7 @@ data:
     fi
 
     # ── 2. CloudFront origin and Route53 alias ──────────────────────────────
-    ALB_DNS=$(kubectl get lb.elbv2.aws.upbound.io "${ALB_MR}" -o jsonpath='{.status.atProvider.dnsName}' 2>/dev/null || echo "")
+    ALB_DNS=$(kubectl get lbs.v1beta1.elbv2.aws.upbound.io "${ALB_MR}" -o jsonpath='{.status.atProvider.dnsName}' 2>/dev/null || echo "")
 
     if [ -z "${ALB_DNS}" ]; then
       echo "ALB reports no dnsName in .status.atProvider yet, nothing to wire"
@@ -80,13 +80,31 @@ data:
 
     # LocalStack does not always report a canonical hosted zone id. The real us-east-1
     # value is the correct fallback and is inert locally either way.
-    ALB_ZONE=$(kubectl get lb.elbv2.aws.upbound.io "${ALB_MR}" -o jsonpath='{.status.atProvider.zoneId}' 2>/dev/null || echo "")
+    ALB_ZONE=$(kubectl get lbs.v1beta1.elbv2.aws.upbound.io "${ALB_MR}" -o jsonpath='{.status.atProvider.zoneId}' 2>/dev/null || echo "")
     ALB_ZONE="${ALB_ZONE:-Z35SXDOTRQ7X7K}"
 
-    CUR_ORIGIN=$(kubectl get distribution.cloudfront.aws.upbound.io "${CF_MR}" -o jsonpath='{.spec.forProvider.origin[0].domainName}' 2>/dev/null || echo "")
+    CUR_ORIGIN=$(kubectl get distributions.v1beta1.cloudfront.aws.upbound.io "${CF_MR}" -o jsonpath='{.spec.forProvider.origin[0].domainName}' 2>/dev/null || echo "")
     if [ "${CUR_ORIGIN}" = "${ALB_DNS}" ]; then
       echo "cloudfront origin already ${ALB_DNS}"
     else
+      # ── The API version here is load-bearing ────────────────────────────
+      # `kubectl patch distribution.cloudfront.aws.upbound.io` resolves to the PREFERRED
+      # version, which is v1beta2, while these manifests are written against v1beta1. The
+      # two are not shape-compatible: Upbound converted singleton lists to objects in
+      # v1beta2, so origin[].customOriginConfig is an array in v1beta1 and an object in
+      # v1beta2. The patch below is v1beta1-shaped and was rejected every two minutes:
+      #
+      #     spec.forProvider.origin[0].customOriginConfig: Invalid value: "array":
+      #       ... in body must be of type object: "array"
+      #
+      # Nothing else showed it. The Distribution stayed SYNCED=True READY=True with its
+      # origin still on the placeholder, so CloudFront existed and served nothing useful.
+      # Route53 Record.alias has the same v1beta1/v1beta2 split.
+      #
+      # Pinning the version, distributions.v1beta1.cloudfront.aws.upbound.io, is what makes
+      # kubectl validate against the same schema the manifest uses. Migrating the manifests
+      # to v1beta2 instead would also work, and means rewriting every nested list as an
+      # object.
       # A merge patch replaces a list wholesale, so the whole origin entry is restated.
       # httpPort stays 4566: LocalStack binds nothing on 80 and multiplexes every
       # emulated endpoint behind its gateway port.
@@ -95,22 +113,22 @@ data:
       # escaping inside a YAML block scalar inside a ConfigMap is three levels of quoting
       # and gets corrupted by the first tool that reformats the file.
       ORIGIN_PATCH=$(printf '{"spec":{"forProvider":{"origin":[{"domainName":"%s","originId":"alb-origin","customOriginConfig":[{"httpPort":4566,"httpsPort":443,"originProtocolPolicy":"http-only","originSslProtocols":["TLSv1.2"]}]}]}}}' "${ALB_DNS}")
-      kubectl patch distribution.cloudfront.aws.upbound.io "${CF_MR}" --type=merge -p "${ORIGIN_PATCH}"
+      kubectl patch distributions.v1beta1.cloudfront.aws.upbound.io "${CF_MR}" --type=merge -p "${ORIGIN_PATCH}"
       echo "patched cloudfront origin: ${CUR_ORIGIN:-unset} -> ${ALB_DNS}"
     fi
 
-    CUR_ALIAS=$(kubectl get record.route53.aws.upbound.io "${REC_MR}" -o jsonpath='{.spec.forProvider.alias[0].name}' 2>/dev/null || echo "")
+    CUR_ALIAS=$(kubectl get records.v1beta1.route53.aws.upbound.io "${REC_MR}" -o jsonpath='{.spec.forProvider.alias[0].name}' 2>/dev/null || echo "")
     if [ "${CUR_ALIAS}" = "${ALB_DNS}" ]; then
       echo "route53 alias already ${ALB_DNS}"
     else
       ALIAS_PATCH=$(printf '{"spec":{"forProvider":{"alias":[{"evaluateTargetHealth":false,"name":"%s","zoneId":"%s"}]}}}' "${ALB_DNS}" "${ALB_ZONE}")
-      kubectl patch record.route53.aws.upbound.io "${REC_MR}" --type=merge -p "${ALIAS_PATCH}"
+      kubectl patch records.v1beta1.route53.aws.upbound.io "${REC_MR}" --type=merge -p "${ALIAS_PATCH}"
       echo "patched route53 alias: ${CUR_ALIAS:-unset} -> ${ALB_DNS}"
     fi
 
     # Printed every loop so `make status`, which tails this log, always has the current
     # entry URLs without querying anything itself.
-    CF_DOMAIN=$(kubectl get distribution.cloudfront.aws.upbound.io "${CF_MR}" -o jsonpath='{.status.atProvider.domainName}' 2>/dev/null || echo "")
+    CF_DOMAIN=$(kubectl get distributions.v1beta1.cloudfront.aws.upbound.io "${CF_MR}" -o jsonpath='{.status.atProvider.domainName}' 2>/dev/null || echo "")
     echo "ENDPOINT App        http://${ALB_DNS}:4566/"
     for PAIR in "argocd-alb:ArgoCD" "signoz-alb:SigNoz"; do
       LB_N="${PROJECT}-${PAIR%%:*}"
