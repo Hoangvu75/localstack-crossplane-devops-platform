@@ -197,13 +197,47 @@ kubectl apply -f gitops/infrastructure/provider/provider-aws.yaml >/dev/null
 # The old probe was wrong twice over: it ran AFTER the apply, and a provider pod reaching
 # Ready does not mean its CRDs are served. condition=Healthy on the Provider object is the
 # signal that the revision is active.
-echo "    waiting for Healthy (packages download from xpkg.upbound.io, 1-3 min)..."
-if ! kubectl wait --for=condition=Healthy provider.pkg.crossplane.io --all --timeout=600s >/dev/null; then
-  echo "ERROR: providers did not reach Healthy. Inspect with:" >&2
-  echo "  kubectl get providers.pkg.crossplane.io" >&2
-  echo "  kubectl describe provider.pkg.crossplane.io provider-family-aws" >&2
-  exit 1
-fi
+# ── Why this is a progress loop and not `kubectl wait` ──────────────────────
+# It was `kubectl wait --for=condition=Healthy provider --all --timeout=600s`, which is
+# both too short and silent. Measured on a cold cache: containerd pulls the eight
+# provider images (200-400 MB each) SERIALLY, one starting roughly every two minutes, so
+# the whole set needs 15-20 minutes. At 600s the run died with five of eight Healthy and
+#     timed out waiting for the condition on providers/provider-aws-ec2
+# while the node sat at 6% CPU and 28% memory. Nothing was wrong; the deadline was.
+#
+# The loop prints x/y as it goes, because ten minutes of no output is indistinguishable
+# from a hang and invites killing a healthy run. The failure message distinguishes "still
+# pulling" from "actually broken", since ContainerCreating means only that the pull has
+# not finished.
+#
+# ec2, iam and s3 are consistently last: they carry by far the most CRDs.
+echo "    waiting for Healthy. Eight images, 200-400 MB each, pulled serially by"
+echo "    containerd -- budget 15-20 minutes on a cold cache."
+PROV_DEADLINE=1800
+PROV_WAITED=0
+while true; do
+  PTOT=$(kubectl get providers.pkg.crossplane.io --no-headers 2>/dev/null | wc -l | tr -d ' ')
+  POK=$(kubectl get providers.pkg.crossplane.io --no-headers 2>/dev/null | awk '$2=="True" && $3=="True"' | wc -l | tr -d ' ')
+  if [ "${PTOT:-0}" -gt 0 ] && [ "$POK" = "$PTOT" ]; then
+    echo "    all ${PTOT} providers Healthy after ${PROV_WAITED}s"
+    break
+  fi
+  if [ "$PROV_WAITED" -ge "$PROV_DEADLINE" ]; then
+    echo "ERROR: ${POK}/${PTOT} providers Healthy after ${PROV_DEADLINE}s." >&2
+    kubectl get providers.pkg.crossplane.io >&2
+    echo "" >&2
+    echo "       This is not necessarily broken. Check whether images are still coming:" >&2
+    echo "         kubectl -n crossplane-system get pods" >&2
+    echo "       ContainerCreating means the pull is still running -- just re-run this" >&2
+    echo "       script, it is idempotent and picks up where this left off." >&2
+    echo "       A CrashLoopBackOff or ImagePullBackOff is the real failure:" >&2
+    echo "         kubectl -n crossplane-system describe pod -l pkg.crossplane.io/provider" >&2
+    exit 1
+  fi
+  echo "    ${POK}/${PTOT} Healthy (${PROV_WAITED}s elapsed)"
+  sleep 30
+  PROV_WAITED=$((PROV_WAITED + 30))
+done
 
 until kubectl get crd providerconfigs.aws.upbound.io >/dev/null 2>&1; do sleep 2; done
 kubectl wait --for=condition=Established crd/providerconfigs.aws.upbound.io --timeout=120s >/dev/null
