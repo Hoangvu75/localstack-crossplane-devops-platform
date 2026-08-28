@@ -34,6 +34,13 @@ export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-mock_secret_key}"
 export PROJECT_NAME="${PROJECT_NAME:-learn-crossplane}"
 export CLUSTER_NAME="${PROJECT_NAME}-dev"
 export GITHUB_BRANCH="${GITHUB_BRANCH:-main}"
+
+# Must match spec.generators[].git.repoURL and spec.template.spec.source.repoURL in
+# gitops/bootstrap/appset.yaml CHARACTER FOR CHARACTER. ArgoCD matches a repository
+# credential to a repo by string comparison on the URL, so a missing .git suffix or an
+# embedded username silently produces "repository not accessible" on a private repo.
+export GITHUB_REPO="${GITHUB_REPO:-github.com/Hoangvu75/localstack-crossplane-devops-platform.git}"
+export GITHUB_REPO_URL="https://${GITHUB_REPO}"
 export SECRET_NAME_GITHUB="${PROJECT_NAME}/github-token"
 
 # Every AWS call in this repo goes through LocalStack. Wrapping it once keeps the

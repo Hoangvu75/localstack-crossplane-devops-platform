@@ -26,11 +26,35 @@ spec:
     - name: clone
       image: alpine/git:v2.43.0
       workingDir: $(workspaces.output.path)
+      env:
+        # Needed because this repository is PRIVATE. An unauthenticated clone of a
+        # private repo fails with "Authentication failed", or worse, with a password
+        # prompt that hangs the step until the PipelineRun timeout.
+        #
+        # optional: true so a public-repo fork still runs with no Secret present; the
+        # credential helper below is only configured when a token actually arrives.
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: git-credentials
+              key: token
+              optional: true
       script: |
         #!/usr/bin/env sh
         set -eu
 
         REV="$(params.revision)"
+
+        # --global, not repo-local: the SHA path below runs `git init` and then fetches,
+        # so at this point there may be no repository to configure yet. Writing the
+        # helper once here covers both the clone and the fetch path.
+        #
+        # A credential helper rather than https://TOKEN@github.com/... in the URL: git
+        # echoes the remote URL in several of its error messages, and the Tekton
+        # Dashboard renders step logs to anyone who can open the page.
+        if [ -n "${GITHUB_TOKEN:-}" ]; then
+          git config --global credential.helper '!f() { echo "username=x-access-token"; echo "password=${GITHUB_TOKEN}"; }; f'
+        fi
 
         echo ">>> Cleaning workspace directory..."
         rm -rf ./* ./.git 2>/dev/null || true

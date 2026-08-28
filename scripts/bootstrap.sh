@@ -187,6 +187,28 @@ else
   kubectl -n tekton-pipelines create secret generic git-credentials \
     --from-literal=token="$TOKEN" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
   echo "    created in tekton-pipelines (value not echoed)"
+
+  # ── ArgoCD repository credential ──────────────────────────────────────
+  # Required whenever the repo is PRIVATE, which this one is. Without it the git files
+  # generator cannot list gitops/*/*/config.yaml, so it returns an empty result and the
+  # ApplicationSet creates zero Applications. Nothing errors in a way you would notice:
+  # `kubectl get applicationset` shows the object as present and healthy, and the only
+  # signal is that `kubectl -n argocd get applications` stays empty.
+  #
+  # The label is what makes ArgoCD read the Secret at all; a correctly shaped Secret
+  # without it is ignored.
+  #
+  # username=x-access-token is the GitHub convention for authenticating with a PAT over
+  # HTTPS. Any non-empty username works, but this one is what GitHub documents.
+  kubectl -n argocd create secret generic repo-${PROJECT_NAME} \
+    --from-literal=type=git \
+    --from-literal=url="${GITHUB_REPO_URL}" \
+    --from-literal=username=x-access-token \
+    --from-literal=password="$TOKEN" \
+    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  kubectl -n argocd label secret repo-${PROJECT_NAME} \
+    argocd.argoproj.io/secret-type=repository --overwrite >/dev/null
+  echo "    ArgoCD repository credential created for ${GITHUB_REPO_URL}"
 fi
 
 # ── 6. Handover ──────────────────────────────────────────────────────────────
@@ -194,8 +216,33 @@ echo ""
 echo ">>> [6/6] ApplicationSet, git takes over from here"
 
 kubectl apply -f gitops/bootstrap/appset.yaml >/dev/null
-APP_COUNT=$(kubectl -n argocd get applications --no-headers 2>/dev/null | wc -l | tr -d ' ')
-echo "    applied; ${APP_COUNT} Applications generated so far (more appear as the generator polls)"
+
+# The git generator polls, so zero Applications immediately after the apply is normal.
+# Zero after 60 seconds is not, and it is the signature of a repo the generator cannot
+# read: wrong branch, or a private repo with no credential. Checked here because the
+# alternative is discovering it twenty minutes later when nothing has deployed.
+echo "    applied, waiting for the git generator to produce Applications..."
+APP_COUNT=0
+for _ in $(seq 1 12); do
+  APP_COUNT=$(kubectl -n argocd get applications --no-headers 2>/dev/null | wc -l | tr -d ' ')
+  if [ "${APP_COUNT}" -gt 0 ]; then break; fi
+  sleep 5
+done
+
+if [ "${APP_COUNT}" -eq 0 ]; then
+  echo "" >&2
+  echo "WARNING: the ApplicationSet generated 0 Applications after 60s. The generator" >&2
+  echo "         cannot read the repository. The three causes, in order of likelihood:" >&2
+  echo "" >&2
+  echo "  1. Branch mismatch. The appset asks for revision \"main\"; check what exists:" >&2
+  echo "       git branch --show-current  &&  git ls-remote --heads origin" >&2
+  echo "  2. Nothing pushed yet. ArgoCD reads GitHub, never this working copy." >&2
+  echo "  3. Private repo, bad or missing credential:" >&2
+  echo "       kubectl -n argocd logs deploy/argocd-applicationset-controller --tail=30" >&2
+  echo "" >&2
+else
+  echo "    ${APP_COUNT} Applications generated"
+fi
 
 ADMIN_PASS=$(kubectl -n argocd get secret argocd-initial-admin-secret \
   -o jsonpath="{.data.password}" 2>/dev/null | base64 -d 2>/dev/null || echo "N/A")
