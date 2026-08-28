@@ -41,9 +41,11 @@ spec:
       spec:
         pipelineRef:
           name: monorepo-ci-pipeline
-        # Without a timeout a wedged dind step occupies the workspace PVC indefinitely.
+        # 2h, not 45m: six images from a cold cache inside DinD overran 45m and the run was
+# cancelled mid-build. See the note in pipelinerun-manual.yaml.
         timeouts:
-          pipeline: "45m"
+          pipeline: "2h"
+          tasks: "110m"
         params:
           - name: repoUrl
             value: $(tt.params.gitRepositoryUrl)

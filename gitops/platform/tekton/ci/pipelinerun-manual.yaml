@@ -8,9 +8,16 @@ metadata:
 spec:
   pipelineRef:
     name: monorepo-ci-pipeline
-  # A wedged dind step otherwise holds the workspace PVC until the cluster-wide default.
+  # Measured, not guessed: 45m was not enough and the run was cancelled mid-build.
+# Six images from a cold cache inside DinD, with /var/lib/docker on an emptyDir so
+# every run re-pulls every base layer. disk-service alone downloads most of a Maven
+# repository. A first run lands in the 25-50 minute range; later runs are no faster,
+# because the emptyDir throws the layer cache away each time.
   timeouts:
-    pipeline: "45m"
+    pipeline: "2h"
+    # Named per task so a cancellation says WHICH step ran out, instead of only
+    # reporting PipelineRunTimeout on the run as a whole.
+    tasks: "110m"
   params:
     - name: repoUrl
       value: "https://github.com/Hoangvu75/localstack-crossplane-devops-platform.git"
