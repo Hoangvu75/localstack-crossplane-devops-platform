@@ -25,9 +25,25 @@ spec:
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
-        # the node user that ships in node:20-alpine
+        # ── runAsUser and fsGroup were MISSING, and the pod could not start ────
+        # With runAsGroup set and runAsUser absent, containerd refuses to build the user
+        # string and the sandbox never comes up:
+        #
+        #     Failed to create pod sandbox: ... failed to generate user string:
+        #     user group "1000" is specified without user
+        #
+        # It presents as ContainerCreating forever, with no image-pull error and no
+        # container to get logs from, so it reads like a slow pull. The two comments here
+        # were left orphaned above seccompProfile, which is what gave the intent away.
+        #
+        # 1000:1000 is the `node` user that ships in node:20-alpine, matching USER node in
+        # apps/web/Dockerfile. fsGroup is what lets kubelet chown the emptyDirs mounted
+        # below, which readOnlyRootFilesystem makes mandatory.
+        #
+        # The sibling learn-opensible lab carries the identical defect in this same file.
+        runAsUser: 1000
         runAsGroup: 1000
-        # so kubelet can chown the emptyDirs below
+        fsGroup: 1000
         seccompProfile:
           type: RuntimeDefault
       # Spread replicas across nodes so losing one node cannot take the app down.

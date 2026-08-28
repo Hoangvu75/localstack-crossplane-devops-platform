@@ -94,7 +94,7 @@ fi
 # and not a UI credential.
 printf "  %-11s %s\n" "SigNoz" "no generated password -- first visit asks you to create an account"
 printf "  %-11s %s\n" "Web app" "no authentication"
-printf "  %-11s %s\n" "Tekton" "no authentication (Dashboard is read-mostly and not exposed via ALB)"
+printf "  %-11s %s\n" "Tekton" "no authentication -- the Dashboard has its own ALB; anyone who reaches it can start and delete PipelineRuns"
 
 echo ""
 hr
