@@ -119,4 +119,8 @@ spec:
         echo "=== All six images built and pushed at tag ${COMMIT_TAG} ==="
   volumes:
     - name: dind-storage
-      emptyDir: {}
+      # Was emptyDir, which threw the layer cache away on every run -- see the long note in
+      # ci/dind-cache-pvc.yaml. The PVC is ReadWriteOnce and two dockerd processes must
+      # never share one /var/lib/docker, so do not run two PipelineRuns at once.
+      persistentVolumeClaim:
+        claimName: dind-cache

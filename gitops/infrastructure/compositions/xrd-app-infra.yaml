@@ -2,6 +2,13 @@ apiVersion: apiextensions.crossplane.io/v1
 kind: CompositeResourceDefinition
 metadata:
   name: xappinfras.devops.platform.io
+  annotations:
+    # ── Wave 0: this XRD is what CREATES the AppInfra CRD ────────────────────
+    # Crossplane watches the XRD and generates a CustomResourceDefinition from it. Until
+    # that CRD is Established, kind AppInfra does not exist and claim-example.yaml cannot
+    # be applied. Unlike sync waves BETWEEN Applications, which the ApplicationSet
+    # controller makes inert, waves WITHIN one Application are honoured.
+    argocd.argoproj.io/sync-wave: "0"
 spec:
   group: devops.platform.io
   names:

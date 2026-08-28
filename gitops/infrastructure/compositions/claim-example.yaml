@@ -3,6 +3,23 @@ kind: AppInfra
 metadata:
   name: sample-microservice-infra
   namespace: default
+  annotations:
+    # Wave 2: last, because its kind is created by the XRD in wave 0.
+    argocd.argoproj.io/sync-wave: "2"
+    # ── Without this, NOTHING in this directory applied ─────────────────────
+    # ArgoCD server-side dry-runs every manifest before applying any of them. On a fresh
+    # cluster the AppInfra CRD does not exist yet, the dry-run of this claim fails, and
+    # ArgoCD rejects the whole sync as invalid:
+    #
+    #     one or more synchronization tasks are not valid (retried 5 times)
+    #     The Kubernetes API could not find devops.platform.io/AppInfra for requested
+    #     resource default/sample-microservice-infra
+    #
+    # So the XRD that would have created the CRD never got applied either -- a deadlock
+    # where the Application shows Healthy with three Missing resources. SkipDryRunOnMissingResource
+    # tells ArgoCD to accept a manifest whose kind it cannot resolve yet and apply it in
+    # its wave, by which time wave 0 has produced the CRD.
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
 spec:
   # Without one of compositionRef / compositionSelector on the claim, or
   # defaultCompositionRef on the XRD, Crossplane has nothing to select and the claim sits
