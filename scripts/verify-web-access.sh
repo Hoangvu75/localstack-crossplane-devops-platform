@@ -49,18 +49,27 @@ JENKINS_DNS=$(alb_dns "${PROJECT_NAME}-jenkins-alb")
 CF_DOMAIN=$(aws_ cloudfront list-distributions \
   --query 'DistributionList.Items[0].DomainName' --output text 2>/dev/null || echo "")
 
-for ROW in "Web app|${APP_DNS}" \
-           "ArgoCD|${ARGO_DNS}" \
-           "Jenkins|${JENKINS_DNS}" \
-           "SigNoz|${SIGNOZ_DNS}" \
-           "CloudFront|${CF_DOMAIN}"; do
+# Three fields: label, host, and the path to probe.
+#
+# Jenkins is the reason for the third. It answers / with 403 because anonymous read is
+# off in casc/jenkins.yaml, so probing / would print a number that looks like a failure
+# every single time and train you to ignore it. /login returns 200 to an unauthenticated
+# request and is served by the same web tier -- which is also why the ALB target group
+# health-checks that path rather than /.
+for ROW in "Web app|${APP_DNS}|/" \
+           "ArgoCD|${ARGO_DNS}|/" \
+           "Jenkins|${JENKINS_DNS}|/login" \
+           "SigNoz|${SIGNOZ_DNS}|/" \
+           "CloudFront|${CF_DOMAIN}|/"; do
   NAME="${ROW%%|*}"
-  HOST="${ROW##*|}"
+  REST="${ROW#*|}"
+  HOST="${REST%%|*}"
+  PATH_="${REST##*|}"
   if [ -z "$HOST" ] || [ "$HOST" = "None" ]; then
     printf "  %-11s %-62s %s\n" "$NAME" "(not created yet)" "-"
     continue
   fi
-  URL="http://${HOST}:${GW}/"
+  URL="http://${HOST}:${GW}${PATH_}"
   printf "  %-11s %-62s %s\n" "$NAME" "$URL" "$(probe "$URL")"
 done
 
