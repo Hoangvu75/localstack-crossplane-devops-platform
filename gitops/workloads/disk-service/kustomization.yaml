@@ -26,4 +26,4 @@ labels:
 images:
 - name: learn-crossplane-disk-service
   newName: 000000000000.dkr.ecr.us-east-1.localhost.localstack.cloud:4566/learn-crossplane-disk-service
-  newTag: 270237c
+  newTag: 03f5c49
