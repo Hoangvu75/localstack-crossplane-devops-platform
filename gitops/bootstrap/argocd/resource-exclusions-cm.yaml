@@ -1,31 +1,42 @@
-# Stops ArgoCD from deleting running builds.
+# ArgoCD settings that have to exist before the ApplicationSet runs.
 #
-# ── The failure this fixes ──────────────────────────────────────────────────
-# PipelineRuns and TaskRuns are created at RUNTIME -- by a webhook, by `kubectl create`,
-# by the TriggerTemplate. They are not in git and never will be. ArgoCD manages the
-# tekton-ci namespace, sees objects there that its manifests do not describe, and prunes
-# them. Its own log says so plainly:
+# ── The failure this file was created for, and why the fix is now gone ──────
+# It carried one exclusion, for tekton.dev PipelineRun and TaskRun. Those objects were
+# created at RUNTIME -- by a webhook, by the TriggerTemplate, by `kubectl create` -- and
+# were never in git. ArgoCD pruned them mid-build, roughly 45 seconds in, leaving only a
+# line in the application-controller log:
 #
 #     Adding resource result, status: 'Pruned', phase: 'Succeeded', message: 'pruned'
 #       application=argocd/platform-tekton kind=PipelineRun name=manual-monorepo-ci-run-...
 #
-# Observed behaviour: a PipelineRun starts, the TaskRun is created, the workspace PVC is
-# provisioned, and roughly 45 seconds later the whole thing vanishes mid-build. With a
-# real webhook every single build would be killed part-way through, and the only trace is
-# a line in the application-controller log.
+# Tekton is gone, so the exclusion is dead and has been removed rather than left as
+# decoration for a CRD that is no longer installed.
 #
-# ── Why exclusion and not prune: false ──────────────────────────────────────
-# Setting prune: false on the tekton Application in its config.yaml would also stop this,
-# but it disables pruning for the Tasks, Pipeline and Triggers as well, so deleting one
-# from git would silently leave it running in the cluster. Excluding just the two runtime
-# kinds keeps GitOps deletion working for everything that genuinely belongs in git.
+# ── The same question, asked of Jenkins ─────────────────────────────────────
+# Jenkins has runtime-created objects too: every build spawns agent Pods in the `jenkins`
+# namespace, which platform-jenkins manages and syncs with prune: true. The shape of the
+# hazard is identical, and it would present the same way -- builds dying part-way with the
+# reason visible only in ArgoCD's log.
 #
-# This is cluster-wide: ArgoCD stops watching these kinds entirely, which is correct.
-# Nothing should ever declare a PipelineRun in git.
+# It has not been reproduced. Agent pods survived a full build without being touched, and
+# the reason to expect that is how ArgoCD decides what to prune: it prunes resources
+# carrying its tracking label (app.kubernetes.io/instance), which it applies itself. Pods
+# created by the Jenkins controller carry `jenkins=slave` and no ArgoCD label, so they are
+# ORPHANED rather than tracked -- reported in the UI, never deleted.
 #
-# argocd-cm ships with an empty data block, so applying this whole ConfigMap is safe.
-# `kubectl apply` replaces data wholesale -- if you add other ArgoCD settings later, they
-# belong in THIS file, not in a second ConfigMap with the same name.
+# No exclusion is added pre-emptively, because the only one that would help is a
+# cluster-wide exclusion of Pod, and blinding ArgoCD to every Pod in the cluster to guard
+# against a failure that has not happened is a far worse trade than the failure.
+#
+# If a build ever does vanish mid-flight, this is the first place to look, and the fix is
+# NOT an exclusion: it is to move the agents into a namespace ArgoCD does not manage, by
+# changing `namespace` in the kubernetes cloud in
+# gitops/platform/jenkins/casc/jenkins.yaml and pointing the Role/RoleBinding there.
+#
+# ── Why this ConfigMap still exists ─────────────────────────────────────────
+# argocd-cm ships with an empty data block, and `kubectl apply` replaces data wholesale.
+# Any future ArgoCD setting belongs in THIS file rather than in a second ConfigMap of the
+# same name, which would silently overwrite whatever the first one set.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -34,12 +45,4 @@ metadata:
   labels:
     app.kubernetes.io/name: argocd-cm
     app.kubernetes.io/part-of: argocd
-data:
-  resource.exclusions: |
-    - apiGroups:
-        - tekton.dev
-      kinds:
-        - PipelineRun
-        - TaskRun
-      clusters:
-        - "*"
+data: {}

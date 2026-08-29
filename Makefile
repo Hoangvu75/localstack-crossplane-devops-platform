@@ -80,11 +80,19 @@ verify:
 # polled run -- the only thing it skips is the SCM poll that would have noticed the
 # commit. Note that it therefore ALSO skips the [skip ci] check, which lives in the
 # polling path: this will happily rebuild a commit polling would have ignored.
+#
+# ── The crumb is not optional ────────────────────────────────────────────────
+# A plain authenticated POST returns 403. Jenkins requires a CSRF crumb on every
+# state-changing request, and the cookie the crumb was issued against has to come back
+# with it -- hence -c then -b on the same jar. Basic auth with a password does not bypass
+# this; only an API token would.
 run-ci:
 	@JPW=$$(kubectl -n jenkins get secret jenkins-secrets -o jsonpath="{.data.adminPassword}" | base64 -d); \
-	kubectl -n jenkins exec deploy/jenkins -c jenkins -- \
-	  curl -s -o /dev/null -w "  build queued: HTTP %{http_code}\n" \
-	  -u "admin:$$JPW" -X POST http://localhost:8080/job/monorepo-ci/build
+	kubectl -n jenkins exec deploy/jenkins -c jenkins -- sh -c \
+	  "C=\$$(curl -s -c /tmp/jk -u 'admin:$$JPW' 'http://localhost:8080/crumbIssuer/api/xml?xpath=concat(//crumbRequestField,\":\",//crumb)'); \
+	   curl -s -b /tmp/jk -u 'admin:$$JPW' -H \"\$$C\" -X POST -o /dev/null \
+	     -w '  build queued: HTTP %{http_code}  (201 = accepted)\n' \
+	     http://localhost:8080/job/monorepo-ci/build"
 
 # Keeps ./data/localstack, so the next `make up` resumes from the persisted state.
 destroy:

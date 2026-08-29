@@ -10,7 +10,7 @@
 #       · loadbalancer                      24  otel-collector
 #   3   cdn-dns                             30  _shared
 #   5   cert-manager                        35  each service
-#   8   tekton
+#   8   jenkins
 #
 # ── Read this before trusting those waves ────────────────────────────────────
 # `argocd.argoproj.io/sync-wave` on an Application only orders anything when a PARENT

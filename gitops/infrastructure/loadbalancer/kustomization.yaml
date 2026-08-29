@@ -6,7 +6,7 @@ kind: Kustomization
 #   alb.yaml         :30080  the public application, via ingress-nginx
 #   alb-argocd.yaml  :30081  the GitOps console
 #   alb-signoz.yaml  :30083  the observability console
-#   alb-tekton.yaml  :30082  the CI dashboard
+#   alb-jenkins.yaml :30082  the CI controller
 #
 # Each carries its own `component:` label, and every Ref/Selector in this directory keys
 # off that label. Reusing one label across two load balancers would make the listener
@@ -18,4 +18,4 @@ resources:
   - listener.yaml
   - alb-argocd.yaml
   - alb-signoz.yaml
-  - alb-tekton.yaml
+  - alb-jenkins.yaml
