@@ -25,4 +25,4 @@ labels:
 images:
 - name: learn-crossplane-history-service
   newName: 000000000000.dkr.ecr.us-east-1.localhost.localstack.cloud:4566/learn-crossplane-history-service
-  newTag: 03f5c49
+  newTag: 2d00b91
