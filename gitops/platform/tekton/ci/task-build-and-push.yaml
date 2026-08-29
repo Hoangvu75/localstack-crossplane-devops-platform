@@ -50,15 +50,35 @@ spec:
         - name: DOCKER_INSECURE_REGISTRY
           value: "$(params.registryHost)"
       # ── Why these numbers, and what they actually control ──────────────────
-      # Six of these Tasks run in parallel, and the memory REQUEST is the throttle. The node
-      # has ~15.5Gi allocatable with ~3.2Gi already requested by everything else, so at 3Gi
-      # apiece roughly four builds are admitted at once and the rest stay Pending until
-      # capacity frees. That is deliberate: Tekton has no maxConcurrency, and Kubernetes
-      # resource requests are the native way to bound it.
+      # Six of these Tasks run in parallel, and the memory REQUEST is the throttle. Tekton
+      # has no maxConcurrency, so Kubernetes resource requests are the native way to bound
+      # it: the node admits what fits and leaves the rest Pending until capacity frees.
       #
-      # Without a request they would all schedule immediately -- the node reports only 20%
-      # of memory as requested while actually using 71%, because most containers here
-      # declare nothing -- and six simultaneous cold builds would exhaust RAM.
+      # The request is sized for the NETWORK, not for memory, and that took a failed run to
+      # learn. It was 3Gi, which admitted four builds at once, and run
+      # monorepo-ci-run-8pwbv split itself into a clean natural experiment:
+      #
+      #     4 pods started together at 05:57:02-03   ALL FOUR FAILED
+      #     2 pods started at 06:01:08-10, alone     BOTH SUCCEEDED
+      #
+      # Every failure was the same, and it names the wrong subsystem:
+      #
+      #     ERROR: failed to solve: node:20-alpine: failed to do request:
+      #     Head "https://registry-1.docker.io/v2/library/node/manifests/20-alpine":
+      #     net/http: TLS handshake timeout
+      #
+      # Not MTU -- the log line above prints `mtu: 1450` and it was correct. Four DinD
+      # daemons pulling base images at once, through LocalStack's DNS and Docker Desktop's
+      # NAT, cannot complete their TLS handshakes. The tell is in the trivial steps: `load
+      # .dockerignore` moved 2 bytes in 9.2s and `load build definition` took 11.2s.
+      #
+      # Memory was never the binding constraint. The node reports 20% of memory REQUESTED
+      # while actually using 75%, because most containers here declare nothing.
+      #
+      # 5Gi admits exactly two: ~15.5Gi allocatable minus ~3.2Gi requested by everything
+      # else leaves ~12.3Gi, and 2 x 5Gi fits where 3 x 5Gi does not. Two is the number the
+      # run above demonstrated, not a guess. Six builds in three waves costs roughly what
+      # the previous four-wide run cost anyway, because the failures were not free.
       #
       # The limit is higher than the request on purpose: a build that briefly needs more
       # should get it, and a runaway one should be OOM-killed rather than taking the node
@@ -66,10 +86,10 @@ spec:
       resources:
         requests:
           cpu: "1"
-          memory: 3Gi
+          memory: 5Gi
         limits:
           cpu: "4"
-          memory: 5Gi
+          memory: 6Gi
       script: |
         #!/usr/bin/env sh
         set -eu

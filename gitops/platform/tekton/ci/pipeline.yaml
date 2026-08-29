@@ -53,12 +53,23 @@ spec:
     # Tekton run them concurrently. How many actually run at once is decided by the memory
     # REQUEST on the Task, not here -- see the note in ci/task-build-and-push.yaml.
     #
+    # ── retries: 2, and why it is not the fix on its own ─────────────────────
+    # Pulling a base image over this network path is genuinely flaky, and a TLS handshake
+    # that times out is exactly what a retry is for.
+    #
+    # It cannot be the whole answer, though, and reaching for it first would have hidden
+    # the real problem. When four builds ran concurrently they ALL failed together; their
+    # retries would have found the node equally free and collided the same way, turning one
+    # fast failure into three slow ones. The concurrency had to come down first -- the
+    # request is now 5Gi, which admits two -- and retries cover what is left.
+    #
     # appDir is the directory under apps/ AND the suffix of the cache PVC.
     # repoSuffix is the ECR repository name after the project prefix. The two differ for
     # exactly one service: apps/web publishes to learn-crossplane-web-app.
     - name: build-web
       taskRef: { name: build-and-push }
       runAfter: [fetch-repository]
+      retries: 2
       workspaces: [{ name: source, workspace: shared-data }]
       params:
         - { name: appDir, value: "web" }
@@ -69,6 +80,7 @@ spec:
     - name: build-cpu-service
       taskRef: { name: build-and-push }
       runAfter: [fetch-repository]
+      retries: 2
       workspaces: [{ name: source, workspace: shared-data }]
       params:
         - { name: appDir, value: "cpu-service" }
@@ -79,6 +91,7 @@ spec:
     - name: build-memory-service
       taskRef: { name: build-and-push }
       runAfter: [fetch-repository]
+      retries: 2
       workspaces: [{ name: source, workspace: shared-data }]
       params:
         - { name: appDir, value: "memory-service" }
@@ -89,6 +102,7 @@ spec:
     - name: build-disk-service
       taskRef: { name: build-and-push }
       runAfter: [fetch-repository]
+      retries: 2
       workspaces: [{ name: source, workspace: shared-data }]
       params:
         - { name: appDir, value: "disk-service" }
@@ -99,6 +113,7 @@ spec:
     - name: build-rest-service
       taskRef: { name: build-and-push }
       runAfter: [fetch-repository]
+      retries: 2
       workspaces: [{ name: source, workspace: shared-data }]
       params:
         - { name: appDir, value: "rest-service" }
@@ -109,6 +124,7 @@ spec:
     - name: build-history-service
       taskRef: { name: build-and-push }
       runAfter: [fetch-repository]
+      retries: 2
       workspaces: [{ name: source, workspace: shared-data }]
       params:
         - { name: appDir, value: "history-service" }
