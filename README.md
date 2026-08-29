@@ -874,3 +874,53 @@ kubectl -n crossplane-system logs deploy/provider-aws-s3-<hash> --tail=50
 ```
 
 `bash scripts/verify-web-access.sh` wraps the parts you look at most.
+
+### 11.8 What `iac-cdn-dns` is, and why half of it is decorative
+
+Two files, three objects, and the most instructive Application in the repo — because it is
+where LocalStack stops behaving like AWS.
+
+| Object | File | What it is for |
+| :--- | :--- | :--- |
+| `Distribution` | `cdn-dns/cloudfront.yaml` | A CloudFront CDN whose **origin is the application ALB** |
+| `Zone` | `cdn-dns/route53.yaml` | The hosted zone `learn-crossplane.internal` |
+| `Record` | `cdn-dns/route53.yaml` | `www.learn-crossplane.internal` → A alias → the ALB |
+
+Live state:
+
+```
+distribution/learn-crossplane-cf     True True   39aeda73
+zone/learn-crossplane-zone           True True   UFT67MCE3WXY1OUMYZUKP4
+record/learn-crossplane-record       True True   ..._www.learn-crossplane.internal_A
+
+cf origin      learn-crossplane-alb.elb.localhost.localstack.cloud
+cf httpPort    4566
+cf domain      39aeda73.cloudfront.localhost.localstack.cloud
+r53 alias      learn-crossplane-alb.elb.localhost.localstack.cloud
+```
+
+**CloudFront works.** `http://39aeda73.cloudfront.localhost.localstack.cloud:4566/` really
+does serve the app through the distribution, which then fetches from the ALB.
+
+**Route53 does not.** The Zone and the Record both exist and both report Ready, and
+`www.learn-crossplane.internal` still resolves nowhere. LocalStack's gateway routes by
+matching the Host header against **its own static hostname patterns**; it never consults
+the Route53 records it is storing. So the record is real data in a real API that nothing
+queries — §6.3. It is worth keeping precisely because it is what you would write for real
+AWS, and because migrating means changing the record, not adding one.
+
+Three details in these two files that are LocalStack-specific and would be wrong on AWS:
+
+- **`customOriginConfig.httpPort: 4566`.** LocalStack binds nothing on port 80 and
+  multiplexes every emulated endpoint behind its gateway port. Real CloudFront would use
+  80, and this is item 4 in the §7 migration list.
+- **`origin[].domainName` and `alias.name` are placeholders in git.** Neither can be known
+  at commit time, and cloudfront/route53 have no `*Ref` pointing at elbv2, so the
+  `localstack-wiring` CronJob patches both from the ALB status. §11.6.
+- **The alias `zoneId` is whatever LocalStack invents** — `Z2P70J7EXAMPLE` here, read from
+  the LB's own `status.atProvider.zoneId`. On real AWS this is the load balancer's
+  canonical hosted zone id, a fixed per-region constant (`Z35SXDOTRQ7X7K` in us-east-1),
+  and getting it wrong produces an alias record that silently points at nothing.
+
+Both patched fields are listed under `ignoreDifferences` in the appset, or selfHeal would
+overwrite the CronJob's work with the git placeholders every reconcile.

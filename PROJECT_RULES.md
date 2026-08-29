@@ -146,3 +146,36 @@ upstream-resolution allowlist in `docker-compose.yml` that a new remote host wil
 To bump a version, download the new file next to the old one, change the reference in
 `kustomization.yaml`, and delete the old file in the same commit. Never hand-edit a
 vendored manifest.
+
+## 8. A PVC stuck in Terminating is almost never stuck
+
+`kubernetes.io/pvc-protection` blocks deletion while ANY pod still references the claim --
+including pods that finished hours ago. Tekton leaves a Completed pod behind for every
+TaskRun, so retiring a cache PVC leaves it Terminating until that pod goes.
+
+```bash
+# who is holding it
+kubectl -n tekton-ci get pods -o json | jq -r '.items[]
+  | select(.spec.volumes[]?.persistentVolumeClaim.claimName=="dind-cache")
+  | .metadata.name'
+
+kubectl -n tekton-ci delete pod <that-pod>     # the PVC disappears within seconds
+```
+
+**Never remove the finalizer by hand.** `kubectl patch pvc ... -p '{"metadata":{"finalizers":null}}'`
+makes the object vanish and orphans the PersistentVolume behind it, leaving the directory
+on the node forever with nothing referencing it. The finalizer is doing its job; find the
+pod instead.
+
+Related: every PipelineRun creates its own 2Gi workspace PVC from the volumeClaimTemplate
+in `ci/pipelinerun-manual.yaml`. Those live as long as the PipelineRun, so old runs are
+what to delete when the namespace accumulates claims:
+
+```bash
+kubectl -n tekton-ci get pipelinerun --sort-by=.metadata.creationTimestamp
+kubectl -n tekton-ci delete pipelinerun <old-run>   # takes its TaskRuns, pods and PVC with it
+```
+
+The six `dind-cache-*` claims are NOT in that category. They are declared in git, they are
+the reason a rebuild takes seconds instead of minutes, and deleting one only costs the next
+build its cache.
