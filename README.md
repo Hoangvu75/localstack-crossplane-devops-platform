@@ -168,6 +168,9 @@ learn-crossplane/
 └── PROJECT_RULES.md                     Safety rules and the CRD-pruning traps
 ```
 
+**New to Crossplane?** §11 explains which AWS service each file under `gitops/infrastructure/`
+configures, how a YAML file becomes an AWS resource, and how the whole thing is authorized.
+
 Adding a component is: create a directory and a five-field `config.yaml`
 (`name`, `namespace`, `manifestPath`, `syncWave`, `prune`). No script edit, no hand-written
 Application.
@@ -408,14 +411,35 @@ repo-server, with an error that looks nothing like DNS.
 
 ### 8.1 The pipeline
 
-`gitops/platform/tekton/ci/pipeline.yaml`, three tasks over one shared PVC workspace:
+`gitops/platform/tekton/ci/pipeline.yaml`. One clone, six parallel builds, one write-back:
+
+```
+                      ┌─ build-web ─────────────┐
+                      ├─ build-cpu-service ─────┤
+  fetch-repository ──►├─ build-memory-service ──┤──► update-gitops-manifests
+                      ├─ build-disk-service ────┤
+                      ├─ build-rest-service ────┤
+                      └─ build-history-service ─┘
+```
+
+The six declare `runAfter: [fetch-repository]` and nothing else, which is what makes Tekton
+run them concurrently. **How many actually run at once is set by the memory request on the
+Task, not by the Pipeline** — Tekton has no `maxConcurrency`, so Kubernetes resource requests
+are the native throttle. At 3Gi apiece on a node with ~15.5Gi allocatable, roughly four run
+together and the rest wait. Each build also has its **own** layer-cache PVC, so changing one
+service leaves the other five hitting cache and finishing in seconds.
+
+`update-gitops-manifests` runs after all six, deliberately: writing a tag for an image that
+was never pushed is how you get `ImagePullBackOff` behind a green pipeline.
+
+The three task definitions:
 
 1. **`git-clone`** — checks out the revision. It accepts a branch, a tag, **or a full commit
    SHA**, and detects which it was given. This matters: the `TriggerBinding` feeds it
    `body.head_commit.id`, and `git clone --branch <sha>` is not a thing — `--branch` accepts
    only a branch or a tag. That single mismatch meant every webhook-driven run died at step
    one, while manual runs, which pass `main`, worked perfectly.
-2. **`monorepo-build-and-push`** — builds all six images in a privileged dind step and pushes
+2. **`build-and-push`** — one service per invocation, in a privileged dind step, pushing
    them to LocalStack ECR tagged with the 7-character short SHA. Failures are collected per
    service and the task exits non-zero. It previously ended in
    `docker push … || echo "Pushed or simulated push"`, which made every push failure a green
@@ -531,3 +555,322 @@ make purge     # also delete ./data/localstack — prompts first
 minutes), and `./data/localstack` is a bind mount that `docker compose down -v` does not
 touch, so every emulated resource comes back on the next `make up`. "I destroyed everything
 and the old ALB is still there" is this, and `make purge` is the answer.
+
+---
+
+## 11. Crossplane, from the ground up
+
+Written for someone who has used Terraform but not Crossplane. If you only read one part,
+read §11.3 — the authorization model is where the two tools differ most, and where the
+confusion is most expensive.
+
+### 11.1 Which AWS service is configured in which file
+
+Everything under `gitops/infrastructure/` is a **managed resource**: a Kubernetes object
+that stands for one AWS resource. 48 of them across 12 files.
+
+| File | AWS service | Objects it creates |
+| :--- | :--- | :--- |
+| `networking/vpc.yaml` | EC2 / VPC | `VPC` — 10.0.0.0/16, DNS hostnames on |
+| `networking/subnets.yaml` | EC2 / VPC | `Subnet` ×4 — private a/b, public a/b, across two AZs |
+| `networking/internet-gateway.yaml` | EC2 / VPC | `InternetGateway` |
+| `networking/route-tables.yaml` | EC2 / VPC | `RouteTable`, `Route` (0.0.0.0/0 → IGW), `RouteTableAssociation` ×2 |
+| `networking/security-groups.yaml` | EC2 / VPC | `SecurityGroup` + `SecurityGroupRule` ×2 (ingress :80, egress all) |
+| `storage/s3-cicd-artifacts.yaml` | S3 | `Bucket` + `BucketPublicAccessBlock` + `BucketServerSideEncryptionConfiguration` + `BucketVersioning` + `BucketLifecycleConfiguration` |
+| `registry/ecr-repositories.yaml` | ECR | `Repository` ×6 (one per service) + `LifecyclePolicy` ×6 |
+| `loadbalancer/alb.yaml` | ELBv2 | `LB` — the application load balancer |
+| `loadbalancer/target-group.yaml` | ELBv2 | `LBTargetGroup` — NodePort 30080, health `/healthz` |
+| `loadbalancer/listener.yaml` | ELBv2 | `LBListener` — :80 → the target group above |
+| `loadbalancer/alb-argocd.yaml` | ELBv2 | `LB` + `LBTargetGroup` (:30081) + `LBListener` |
+| `loadbalancer/alb-tekton.yaml` | ELBv2 | `LB` + `LBTargetGroup` (:30082) + `LBListener` |
+| `loadbalancer/alb-signoz.yaml` | ELBv2 | `LB` + `LBTargetGroup` (:30083) + `LBListener` |
+| `cdn-dns/cloudfront.yaml` | CloudFront | `Distribution` — origin is the app ALB |
+| `cdn-dns/route53.yaml` | Route53 | `Zone` + `Record` (alias → app ALB) |
+| `iam/roles.yaml` | IAM | `Role` + `Policy` + `RolePolicyAttachment` |
+| `provider/provider-aws.yaml` | — | `Provider` ×8 — the controllers, not AWS resources |
+| `provider/secret-credentials.yaml` | — | `Secret` — the AWS credentials |
+| `provider/provider-config.yaml` | — | `ProviderConfig` — endpoint + which credentials to use |
+| `compositions/` | — | The abstraction layer. §11.5 |
+
+Note the last four rows: they are **not** AWS resources. They are the machinery that lets
+the other rows become AWS resources.
+
+**A trap worth naming now:** `iam/roles.yaml` creates an IAM Role, and that Role is *not*
+how Crossplane authenticates to AWS. It is a resource Crossplane **creates**, for the
+application workloads to use later. What Crossplane itself authenticates with is in
+§11.3. The two are unrelated and it is easy to assume otherwise.
+
+### 11.2 How a YAML file becomes an AWS resource
+
+Terraform runs as a CLI, reads state, makes a plan, applies it, exits. Crossplane runs as
+**controllers that never exit**. The chain for a single resource:
+
+```
+gitops/infrastructure/storage/s3-cicd-artifacts.yaml
+  │   kind: Bucket, apiVersion: s3.aws.upbound.io/v1beta1
+  ▼
+ArgoCD applies it to the cluster
+  │
+  ▼
+The CRD "buckets.s3.aws.upbound.io" accepts it
+  │   That CRD was installed by the provider-aws-s3 PACKAGE, not by this repo.
+  ▼
+The provider-aws-s3 CONTROLLER (a Deployment in crossplane-system) sees a new Bucket
+  │
+  ├─ reads spec.providerConfigRef  → defaults to the ProviderConfig named "default"
+  │
+  ├─ ProviderConfig tells it TWO things:
+  │     credentials → read the Secret aws-creds in crossplane-system
+  │     endpoint    → talk to http://localstack:4566 instead of real AWS
+  │
+  ▼
+Calls the AWS API (the Upbound providers wrap the Terraform AWS provider internally)
+  │
+  ▼
+Writes back onto the SAME object:
+     status.atProvider     what AWS actually reports
+     status.conditions     Synced=True (request accepted), Ready=True (resource exists)
+     metadata.annotations  crossplane.io/external-name = the real AWS name
+```
+
+Then it does it again, every few minutes, forever. That loop is the whole point: if
+someone deletes the bucket in the AWS console, the controller notices on the next pass and
+recreates it. Terraform would only notice at the next `plan`.
+
+**Where each piece lives:**
+
+| Piece | Where |
+| :--- | :--- |
+| The Crossplane engine | `crossplane` Deployment, namespace `crossplane-system`, installed by `scripts/bootstrap.sh` via Helm, pinned to 1.16.0 |
+| The 8 provider controllers | `provider-aws-*` Deployments in `crossplane-system` — one per AWS service family |
+| The CRDs | Installed by the provider packages. `kubectl get crds | grep upbound` lists ~1000 |
+| Your desired state | `gitops/infrastructure/`, applied by ArgoCD |
+| The observed state | `status.atProvider` on each object |
+
+### 11.3 How it connects to AWS, and how it is authorized
+
+There are **two completely separate permission systems**, and mixing them up is the most
+common Crossplane misunderstanding.
+
+**Plane 1 — Kubernetes RBAC: what the controller may do inside the cluster.**
+
+Each provider runs under its own ServiceAccount, and Crossplane generates the RBAC for it:
+
+```
+Deployment  provider-aws-s3-d17766e0e571
+  serviceAccountName: provider-aws-s3-d17766e0e571
+       ▲
+       │ bound by
+ClusterRoleBinding  crossplane:provider:provider-aws-s3-d17766e0e571:system
+       │ to
+ClusterRole         crossplane:provider:provider-aws-s3-d17766e0e571:system
+                      - watch/update Buckets and the other s3 CRDs
+                      - read Secrets (this is how it reaches aws-creds)
+                      - write Events
+```
+
+You do not write this RBAC. Crossplane's RBAC manager creates it when the `Provider` is
+installed, which is why `provider/provider-aws.yaml` is only eight short blocks. Inspect it
+with:
+
+```bash
+kubectl get clusterrole | grep crossplane:provider
+```
+
+This plane governs the cluster only. It grants nothing in AWS.
+
+**Plane 2 — AWS credentials: what the controller may do in AWS.**
+
+```yaml
+# gitops/infrastructure/provider/secret-credentials.yaml
+kind: Secret
+metadata: { name: aws-creds, namespace: crossplane-system }
+stringData:
+  credentials: |
+    [default]
+    aws_access_key_id = mock_access_key
+    aws_secret_access_key = mock_secret_key
+```
+
+```yaml
+# gitops/infrastructure/provider/provider-config.yaml
+kind: ProviderConfig
+metadata: { name: default }        # ← managed resources reference this name by default
+spec:
+  credentials:
+    source: Secret                 # ← read them from a Secret
+    secretRef: { namespace: crossplane-system, name: aws-creds, key: credentials }
+  endpoint:
+    url: { type: Static, static: http://localstack:4566 }
+    hostnameImmutable: true
+```
+
+That is the entire link between Kubernetes and AWS. Two objects.
+
+The credentials are deliberately fake. LocalStack accepts any credential and never checks a
+signature, so these grant everything and are worth nothing outside this laptop — which is
+why the Secret is committed to git. **On real AWS none of this survives:** delete the
+Secret, delete the whole `spec.endpoint` block, and switch to IRSA, where the provider's
+ServiceAccount is annotated with a role ARN and AWS itself issues short-lived credentials.
+README §7 lists the full migration.
+
+**Why `http://localstack:4566` and not `localhost`.** The controllers are pods inside the
+cluster. `localhost` there is the pod itself. `localstack` is the Docker Compose service
+name, resolvable on the shared network. The host uses `http://localhost:4566` — same
+service, different vantage point.
+
+**Why `hostnameImmutable: true` matters.** Without it the AWS SDK rewrites the endpoint
+host per service — `bucket-name.localstack:4566` for S3, `ecr.localstack` for ECR — because
+that is how real AWS addresses those services. LocalStack serves everything on one host, so
+the rewrite has to be turned off.
+
+**The snake_case trap.** The four `skip_*` toggles and `s3_use_path_style` in that file are
+snake_case because the CRD declares them that way. In camelCase the API server **prunes
+them silently** — the object is accepted, the fields vanish, and S3 fails much later for
+reasons that point nowhere near here. `scripts/bootstrap.sh` asserts all four survived, and
+the `localstack-wiring` CronJob re-checks on every loop. §6.1.
+
+### 11.4 References: how one resource points at another
+
+Terraform writes `vpc_id = aws_vpc.main.id`. Crossplane has no expression language, so it
+uses one of three forms:
+
+```yaml
+vpcId: vpc-0a3ac35                  # the literal value, if you know it
+vpcIdRef:      { name: learn-crossplane-vpc }        # by Kubernetes object name
+vpcIdSelector: { matchLabels: { environment: dev } } # by label
+```
+
+A `Ref` or `Selector` is an **input**. Crossplane resolves it and then writes the resolved
+value back into `spec.forProvider` alongside it. That is worth knowing for two reasons.
+
+**It creates permanent ArgoCD drift.** Git has only the selector; the live object also has
+the `*Ref` and the concrete ARN, so the two never match. `LBListener` was stuck OutOfSync
+for exactly this. The appset now excludes those four field paths — and only for that kind,
+because ServerSideDiff reconciles top-level resolved fields on its own and only fails on
+values nested inside an array (`defaultAction[].targetGroupArn`).
+
+**The suffix follows the AWS field, not a convention.** `subnets` (a list) gives
+`subnetRefs`; `subnetId` (a scalar) gives `subnetIdRef`. Guessing `subnetIdRefs` on an
+elbv2 `LB` produces a field the API server prunes without a word, and the load balancer
+then fails to create for want of subnets. Check before you guess:
+
+```bash
+kubectl explain lb.elbv2.aws.upbound.io.spec.forProvider --recursive | grep -i subnet
+```
+
+And `matchControllerRef: true` inside a selector means "only match resources composed by
+the same composite". Standalone resources have no controller reference, so it matches
+nothing and the resource sits at `cannot resolve references` forever.
+
+### 11.5 What `iac-compositions` is
+
+This is the part that makes Crossplane more than YAML-flavoured Terraform, and the reason
+the project has it at all. Three objects, in `gitops/infrastructure/compositions/`:
+
+| File | Object | In one line |
+| :--- | :--- | :--- |
+| `xrd-app-infra.yaml` | `CompositeResourceDefinition` | Defines a **new API of your own**: "an `AppInfra` has an `environment`" |
+| `composition-aws.yaml` | `Composition` | The implementation: an `AppInfra` means one S3 bucket plus one ECR repository |
+| `claim-example.yaml` | `AppInfra` | A request: "give me an AppInfra for dev" |
+
+Applying the XRD makes Crossplane generate a real CRD, so `AppInfra` becomes a kind your
+cluster understands. A developer then writes five lines:
+
+```yaml
+apiVersion: devops.platform.io/v1alpha1
+kind: AppInfra
+metadata: { name: sample-microservice-infra }
+spec:
+  compositionRef: { name: app-infra-aws }
+  environment: dev
+```
+
+and gets, without knowing that S3 or ECR exist:
+
+```
+sample-microservice-infra
+  └─ XAppInfra/sample-microservice-infra-f5ztv
+       ├─ Bucket/sample-microservice-infra-f5ztv-bucket        → real S3 bucket
+       └─ Repository/sample-microservice-infra-f5ztv-repo      → real ECR repository
+```
+
+That is the "platform as a product" idea: the platform team owns the Composition and can
+change *how* infrastructure is built — add encryption, change naming, swap clouds — without
+any application team editing anything. Terraform modules get close, but the consumer still
+runs Terraform and holds cloud credentials. Here the consumer only submits a Kubernetes
+object and never touches AWS.
+
+**Why it was broken, and what that teaches.** The Application showed `Healthy` with all
+three resources `Missing`, and `one or more synchronization tasks are not valid`. ArgoCD
+dry-runs every manifest before applying any of them; on a fresh cluster the `AppInfra` CRD
+does not exist yet, the dry-run of the claim failed, and the entire sync was rejected —
+including the XRD that would have created that CRD. A deadlock reporting itself as healthy.
+Fixed with sync-wave 0/1/2 (waves *within* one Application are honoured, unlike waves
+between ApplicationSet-generated Applications) plus `SkipDryRunOnMissingResource` on the
+claim.
+
+`compositionRef` is required, incidentally. Having exactly one matching Composition is not
+enough — selection is explicit by design, so adding a second Composition later cannot
+silently re-point existing claims.
+
+### 11.6 What `localstack-wiring` is
+
+A CronJob in `gitops/platform/localstack-wiring/`, every two minutes. It exists because
+three pieces of state **cannot be written down as a manifest** — their values are assigned
+at creation time:
+
+| What | Why it cannot be declared |
+| :--- | :--- |
+| ALB target group membership | k3d gives the node a new container IP on every cluster recreation |
+| CloudFront origin `domainName` | Needs the ALB's DNS name, and cloudfront has no `*Ref` pointing at elbv2 |
+| Route53 `alias.name` and `zoneId` | Same, plus the ALB's canonical hosted zone id |
+
+In the OpenTofu sibling lab these are ordinary interpolations — `aws_lb.main.dns_name`.
+Crossplane has no equivalent between two standalone managed resources, and this is the one
+place where it is strictly weaker.
+
+All three used to be one-shot host scripts you had to remember to re-run. As a CronJob they
+are declared in git, versioned with everything else, and self-healing: it no longer matters
+whether the ALB existed when the manifest first synced, or whether the node IP changed an
+hour ago. Every write is compared first, so a converged cluster only logs.
+
+Git holds documented placeholders for the two patched fields, and the appset lists those
+paths under `ignoreDifferences` so selfHeal does not overwrite the patch every reconcile.
+
+It also re-asserts the ProviderConfig snake_case toggles on every loop, because that
+failure is silent everywhere else.
+
+Read what it last did:
+
+```bash
+kubectl -n localstack-wiring logs -l app=localstack-wiring --tail=20
+```
+
+The fully declarative alternative, if you want to take it further: pull the LB,
+Distribution and Record into one Composition and hop the value through the composite with
+`ToCompositeFieldPath` → `FromCompositeFieldPath`. That is the idiomatic Crossplane answer
+to "resource B needs a runtime value from resource A", and it is what would let you delete
+this CronJob.
+
+### 11.7 Reading the state
+
+```bash
+kubectl get managed          # every AWS resource Crossplane owns, in one table
+```
+
+The two status columns mean different things, and the distinction saves the most time:
+
+| SYNCED | READY | Meaning |
+| :--- | :--- | :--- |
+| `False` | — | **The request never reached AWS.** A selector matched nothing, a referenced object is absent, or a field was pruned by the API server. Look at the manifest. |
+| `True` | `False` | AWS received it and rejected it, or it is still being created. Look at the provider's error. |
+| `True` | `True` | Reconciled. |
+
+```bash
+kubectl describe bucket.s3.aws.upbound.io learn-crossplane-cicd-artifacts   # Events carry the provider error
+kubectl get providers.pkg.crossplane.io                                     # are the controllers even running
+kubectl -n crossplane-system logs deploy/provider-aws-s3-<hash> --tail=50
+```
+
+`bash scripts/verify-web-access.sh` wraps the parts you look at most.
