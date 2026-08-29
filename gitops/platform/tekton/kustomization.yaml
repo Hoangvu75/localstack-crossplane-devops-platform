@@ -68,3 +68,4 @@ resources:
   - ci/task-git-update-workloads.yaml
   - ci/pipeline.yaml
   - ci/triggers.yaml
+  - ci/git-poller.yaml
