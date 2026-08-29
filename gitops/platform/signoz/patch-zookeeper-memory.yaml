@@ -1,0 +1,44 @@
+# ── Why Zookeeper was the second-largest process in the cluster ──────────────
+# It was resident at 737Mi, behind only ClickHouse, to coordinate a ClickHouse cluster of
+# replicasCount: 1, shardsCount: 1. The reason is one line in the vendored chart:
+#
+#     ZOO_HEAP_SIZE=1024
+#
+# Bitnami's entrypoint turns that into -Xms/-Xmx, so the JVM was handed a full gigabyte of
+# heap and, as JVMs do, grew into it and never gave it back. The container had
+# `requests: 256Mi` and `limits: {}` -- nothing capped it, and the request was fiction:
+# the pod asked the scheduler for 256Mi while using nearly three times that.
+#
+# That gap, repeated across this cluster, is why the node reported 20% of memory REQUESTED
+# while actually using 75%, and why it thrashed: MemFree fell to 356MB, the kernel spent
+# its time reclaiming page cache, and load average sat at 7.97 with the CPU at 6% -- the
+# signature of processes blocked in I/O, not of processes doing work. Everything felt
+# slow, the SigNoz UI most visibly of all.
+#
+# 256MB of heap is ample here. This Zookeeper stores a handful of ClickHouse coordination
+# znodes; it is not fronting a Kafka fleet.
+#
+# The limit is set as well as the heap, and deliberately above it: the JVM needs
+# non-heap memory too (metaspace, thread stacks, direct buffers), so a limit equal to the
+# heap is an OOMKill waiting for its first GC pause.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: signoz-zookeeper
+  namespace: signoz
+spec:
+  template:
+    spec:
+      containers:
+        - name: zookeeper
+          env:
+            # Merged by name into the chart's env list, not replacing it.
+            - name: ZOO_HEAP_SIZE
+              value: "256"
+          resources:
+            requests:
+              # Raised to match reality. A request the pod exceeds by 3x is not a
+              # scheduling hint, it is a lie the scheduler acts on.
+              memory: 320Mi
+            limits:
+              memory: 512Mi
