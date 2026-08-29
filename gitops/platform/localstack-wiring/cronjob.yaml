@@ -160,9 +160,21 @@ data:
     #     jenkins-alb (annotated)   2 -> 2    +0
     #     signoz-alb  (not yet)   837 -> 841  +4
     #
-    # On real AWS this bug would have announced itself within the hour -- the quota is 50
-    # listeners per ALB, so the 51st CreateListener fails loudly. LocalStack enforces no
-    # quota, which is the only reason it reached 855 in silence. See README section 6.
+    # ── The runaway is a LocalStack artefact; the cause is not ─────────────
+    # An earlier version of this note blamed the 50-listeners-per-ALB quota, and that was
+    # wrong in a way worth correcting rather than deleting. The quota counts DISTINCT
+    # listeners, one per port. What actually happens on real AWS is stricter and faster:
+    # a second listener on a port already in use is refused outright with
+    # DuplicateListener, so the SECOND CreateListener fails, not the fifty-first.
+    #
+    # On AWS the bug therefore produces no duplicates at all -- it produces one loud,
+    # permanent error on a resource that never goes Ready. LocalStack does allow two
+    # listeners on the same port, and that leniency is the whole reason 855 accumulated in
+    # silence over 26 hours.
+    #
+    # So the EXPLOSION is a LocalStack artefact. The CAUSE -- two server-side-apply
+    # managers fighting over an atomic array -- travels to AWS unchanged, where it stops
+    # being a slow leak and becomes an obvious outage. See README section 6.
     #
     # `|| true` on the annotate: a listener that genuinely has not been created yet has no
     # ARN, and this loop must not fail the CronJob over a resource that is simply not ready.
