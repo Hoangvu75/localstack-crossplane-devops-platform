@@ -320,18 +320,19 @@ TOKEN=$(aws_ secretsmanager get-secret-value --secret-id "$SECRET_NAME_GITHUB" \
 
 if [ -z "$TOKEN" ] || [ "$TOKEN" = "dummy_token_for_local_testing" ]; then
   echo "    WARNING: no usable token in Secrets Manager (${SECRET_NAME_GITHUB})." >&2
-  echo "             The Tekton git push step will fail with an explicit error until you" >&2
-  echo "             set GITHUB_TOKEN in .env and re-run: make secrets && make bootstrap" >&2
+  echo "             Jenkins cannot clone this private repo or push image tags without it," >&2
+  echo "             so the job will fail on checkout. Set GITHUB_TOKEN in .env and re-run:" >&2
+  echo "                 make secrets && make bootstrap" >&2
   echo "             Everything else works." >&2
 else
-  # The namespace does not exist yet, because ArgoCD creates it when it syncs the tekton
+  # The namespace does not exist yet, because ArgoCD creates it when it syncs the jenkins
   # Application, so create it here rather than depending on sync ordering.
-  kubectl create namespace tekton-ci --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  kubectl create namespace jenkins --dry-run=client -o yaml | kubectl apply -f - >/dev/null
   # dry-run piped to apply rather than create secret, so re-running rotates the value
   # instead of failing with AlreadyExists.
-  kubectl -n tekton-ci create secret generic git-credentials \
+  kubectl -n jenkins create secret generic git-credentials \
     --from-literal=token="$TOKEN" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-  echo "    created in tekton-ci (value not echoed)"
+  echo "    created in jenkins (value not echoed)"
 
   # ── ArgoCD repository credential ──────────────────────────────────────
   # Required whenever the repo is PRIVATE, which this one is. Without it the git files
@@ -354,6 +355,37 @@ else
   kubectl -n argocd label secret repo-${PROJECT_NAME} \
     argocd.argoproj.io/secret-type=repository --overwrite >/dev/null
   echo "    ArgoCD repository credential created for ${GITHUB_REPO_URL}"
+fi
+
+# ── Jenkins admin credentials ────────────────────────────────────────────────
+# Outside the token check on purpose: Jenkins must be able to start and be logged into
+# even when no GitHub token is configured. Without this Secret the controller crash-loops
+# on a missing secretKeyRef, which reads as "Jenkins is broken" rather than "a credential
+# is missing".
+#
+# ── Why it is generated here and not committed ───────────────────────────────
+# gitops/platform/jenkins/casc/jenkins.yaml interpolates ${JENKINS_ADMIN_PASSWORD} from
+# the controller's environment precisely so the password never enters git. Generating it
+# at bootstrap keeps that true without asking anyone to invent one.
+#
+# ── Why it is NOT rotated on re-run ──────────────────────────────────────────
+# Every other secret here is written with `dry-run | apply`, which deliberately rotates
+# the value. This one checks first: a bootstrap re-run is a routine thing, and silently
+# changing the password someone has already saved would turn a routine re-run into a
+# lockout with no error message anywhere.
+kubectl create namespace jenkins --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+if kubectl -n jenkins get secret jenkins-secrets >/dev/null 2>&1; then
+  echo "    jenkins-secrets already exists, left unchanged (re-run safe)"
+else
+  # openssl is present wherever the AWS CLI is; tr strips the characters that make a
+  # password annoying to paste out of a terminal.
+  JENKINS_PW=$(openssl rand -base64 24 | tr -d '/+=' | cut -c1-20)
+  kubectl -n jenkins create secret generic jenkins-secrets \
+    --from-literal=adminPassword="$JENKINS_PW" \
+    --from-literal=cascReloadToken="$(openssl rand -hex 16)" \
+    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  echo "    jenkins-secrets created — admin password: ${JENKINS_PW}"
+  echo "    (also recoverable later with: make verify)"
 fi
 
 # ── 6. Handover ──────────────────────────────────────────────────────────────

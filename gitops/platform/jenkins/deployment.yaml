@@ -1,0 +1,183 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jenkins
+  namespace: jenkins
+  labels:
+    app.kubernetes.io/name: jenkins
+    app.kubernetes.io/component: controller
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: JENKINS_HOME is a ReadWriteOnce volume, so a second pod
+  # can never attach it and a rolling update deadlocks with the new pod Pending forever.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: jenkins
+      app.kubernetes.io/component: controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: jenkins
+        app.kubernetes.io/component: controller
+    spec:
+      serviceAccountName: jenkins
+      securityContext:
+        # All three together. runAsGroup without runAsUser is what left the web deployment
+        # in permanent ContainerCreating with "failed to generate user string" -- see
+        # gitops/workloads/web/deployment.yaml. 1000 is `jenkins` in the official image.
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        runAsNonRoot: true
+      initContainers:
+        # ── Plugins are installed here, not at first boot ────────────────────
+        # Jenkins will happily download plugins on demand, which makes the controller's
+        # behaviour depend on what updates.jenkins.io served the day it started. Pinning
+        # them here is the same discipline this repo applies to every upstream manifest:
+        # vendored and versioned, never fetched-latest at sync time.
+        #
+        # Only the top-level plugins are pinned. jenkins-plugin-cli resolves their
+        # dependencies, and those versions still float -- an honest, documented gap. The
+        # way to close it is to run the CLI once, capture the full resolved set, and list
+        # all of it here.
+        #
+        # Reachability was verified before relying on it: updates.jenkins.io resolves and
+        # downloads from inside this cluster despite not being in
+        # DNS_NAME_PATTERNS_TO_RESOLVE_UPSTREAM, because that list forces domains upstream
+        # rather than restricting them.
+        - name: install-plugins
+          image: jenkins/jenkins:2.568.2-lts-jdk21
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              jenkins-plugin-cli \
+                --verbose \
+                --plugin-download-directory /plugins \
+                --plugins \
+                  "configuration-as-code:2117.vc05a_0b_e6b_f4e" \
+                  "job-dsl:3732.v9a_c49a_61a_313" \
+                  "kubernetes:4547.v52f3080db_8cd" \
+                  "workflow-aggregator:608.v67378e9d3db_1" \
+                  "git:5.10.1" \
+                  "credentials-binding:728.v902a_273b_8947"
+              echo ">>> installed:"
+              ls -1 /plugins | wc -l
+          volumeMounts:
+            - name: plugins
+              mountPath: /plugins
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+      containers:
+        - name: jenkins
+          image: jenkins/jenkins:2.568.2-lts-jdk21
+          imagePullPolicy: IfNotPresent
+          env:
+            # Where JCasC reads its configuration. Without this the ConfigMap is mounted
+            # and ignored, and Jenkins comes up asking for the setup wizard.
+            - name: CASC_JENKINS_CONFIG
+              value: /var/jenkins_config/jenkins.yaml
+            - name: JAVA_OPTS
+              # ── -Xmx is set for the same reason Zookeeper's ZOO_HEAP_SIZE was cut ──
+              # A JVM with no -Xmx sizes its heap from the machine it thinks it is on.
+              # Under cgroup v1 -- which this node runs, `stat -fc %T /sys/fs/cgroup`
+              # reports tmpfs -- that machine is the whole 15.5Gi node, not the container.
+              # Zookeeper did exactly this and sat at 737Mi to coordinate a single-replica
+              # ClickHouse. Set the heap explicitly, and set the container limit above it
+              # so metaspace, thread stacks and direct buffers have somewhere to live.
+              #
+              # runSetupWizard=false is what makes "no dashboard configuration" true
+              # rather than aspirational: there is no unlock screen and no initial admin
+              # password file, because JCasC has already defined the admin user.
+              value: >-
+                -Xmx768m
+                -XX:MaxRAMPercentage=60
+                -Djenkins.install.runSetupWizard=false
+                -Dcasc.reload.token=$(CASC_RELOAD_TOKEN)
+            - name: CASC_RELOAD_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: jenkins-secrets
+                  key: cascReloadToken
+                  optional: true
+            # Interpolated into casc.yaml by JCasC. Kept in a Secret so the credential
+            # never appears in a manifest, a ConfigMap, or `kubectl get -o yaml` of this
+            # Deployment.
+            - name: JENKINS_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: jenkins-secrets
+                  key: adminPassword
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: git-credentials
+                  key: token
+                  optional: true
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: agent
+              containerPort: 50000
+          volumeMounts:
+            - name: jenkins-home
+              mountPath: /var/jenkins_home
+            - name: casc
+              mountPath: /var/jenkins_config
+              readOnly: true
+            # The image copies anything here into JENKINS_HOME/plugins at startup.
+            - name: plugins
+              mountPath: /usr/share/jenkins/ref/plugins
+          resources:
+            requests:
+              cpu: 500m
+              # Honest, unlike the 200Mi ClickHouse asked for while using 1889Mi. A JVM
+              # with -Xmx768m does not fit in less than this.
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 1536Mi
+          # ── Probes that can disagree with each other ─────────────────────────
+          # /login answers as soon as the web tier is up; JCasC may still be applying.
+          # Readiness therefore gates traffic while startup gates the restart decision --
+          # the distinction history-service lacked, where liveness checked only the HTTP
+          # server and Kubernetes was content to leave a broken pod running for 174
+          # minutes. See PROJECT_RULES.md rule 10.
+          startupProbe:
+            httpGet:
+              path: /login
+              port: http
+            # Plugin loading plus JCasC on a contended node is slow: 5s x 60 = 5 minutes
+            # before Kubernetes gives up, rather than a restart loop that never finishes.
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /login
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /login
+              port: http
+            periodSeconds: 20
+            failureThreshold: 5
+      volumes:
+        - name: jenkins-home
+          persistentVolumeClaim:
+            claimName: jenkins-home
+        - name: casc
+          configMap:
+            name: jenkins-casc
+        - name: plugins
+          emptyDir: {}

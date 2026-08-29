@@ -1,0 +1,52 @@
+# ── What the kubernetes plugin actually needs, and nothing more ──────────────
+# The Jenkins controller schedules each build as a throwaway pod and streams its logs.
+# That is the whole of its cluster interaction, so the Role is scoped to one namespace and
+# to the four resources involved. No ClusterRole: Jenkins has no business reading the rest
+# of the cluster, and a CI controller is exactly the kind of thing that should not.
+#
+# pods/exec is the one entry that looks alarming and is not optional -- the plugin uses it
+# to run each build step inside a named container of the agent pod. Without it every
+# `container('dind') { ... }` block in the Jenkinsfile fails.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jenkins
+  namespace: jenkins
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: jenkins-agents
+  namespace: jenkins
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log", "events"]
+    verbs: ["get", "list", "watch"]
+  # The per-service build caches are PVCs the agent pods mount. Read-only: Jenkins
+  # references them, the manifests in this repo create them.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: jenkins-agents
+  namespace: jenkins
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: jenkins-agents
+subjects:
+  - kind: ServiceAccount
+    name: jenkins
+    namespace: jenkins
