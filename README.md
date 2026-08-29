@@ -424,18 +424,21 @@ repo-server, with an error that looks nothing like DNS.
 | 1 | **ProviderConfig** | Delete the whole `spec.endpoint` block and the four `skip_*` toggles. Turn `s3_use_path_style` off. |
 | 2 | **Credentials** | Replace the `aws-creds` Secret with IRSA: annotate the provider ServiceAccount with a role ARN and set `source: IRSA`. Delete `secret-credentials.yaml` from git. |
 | 3 | **Compositions** | Migrate to Crossplane v2: `crossplane beta convert pipeline-composition`, install `function-patch-and-transform`, then unpin the chart in step 02. |
-| 4 | **CloudFront origin, Route53 alias** | Replace the `localstack-wiring` CronJob with a Composition that hops the ALB `status.atProvider.dnsName` through the composite, then delete `gitops/platform/localstack-wiring/` and the two `ignoreDifferences` entries with it. Also set `customOriginConfig.httpPort: 80`. |
+| 4 | **CloudFront origin, Route53 alias, ALB listeners** | Replace the `localstack-wiring` CronJob with a Composition that hops the ALB `status.atProvider.dnsName` through the composite, then delete `gitops/platform/localstack-wiring/` and the two `ignoreDifferences` entries with it. Also set `customOriginConfig.httpPort: 80`.<br><br>**This item is larger than it looks, and it is the one to do first.** That CronJob also writes `crossplane.io/external-name` onto the four LBListeners, and without it Crossplane cannot find the listener it just created and makes another every 90 seconds. Deleting the CronJob deletes that fix while leaving its cause -- two server-side-apply managers fighting over the atomic `defaultAction` array. On LocalStack that produced 855 listeners in silence; on real AWS it stops at the 50-per-ALB quota and `CreateListener` starts failing outright. The Composition is what actually fixes it, by leaving only ONE controller writing that field. |
 | 5 | **Route53 alias zone id** | Use the ALB real canonical hosted zone id (us-east-1: `Z35SXDOTRQ7X7K`), and delegate the domain NS records. |
 | 6 | **Security groups** | The rules in `networking/security-groups.yaml` become enforced. Narrow the `0.0.0.0/0` ingress and drop the blanket egress. |
 | 7 | **ALB targets** | Switch `targetType` to `instance` and attach the target group to an Auto Scaling group. Then delete the imperative `register-targets` calls in steps 03 and 05. |
 | 8 | **Multi-AZ NAT** | Add NAT gateways per AZ with dedicated route tables. |
 | 9 | **TLS** | Issue ACM certificates in `us-east-1` for CloudFront, add an HTTPS listener, redirect HTTP. |
 | 10 | **ECR immutability** | `imageTagMutability: IMMUTABLE`. Tags are already commit SHAs, so nothing else changes. |
-| 11 | **Tekton registry auth** | Drop `--insecure-registry`, keep the `aws ecr get-login-password` login, and add the AWS CLI to the build image so it is no longer conditional. |
-| 12 | **Webhook secret** | Add `secretRef` to the github interceptor (§8.2). Non-negotiable once the listener is public. |
+| 11 | **Jenkins registry auth** | Drop `--insecure-registry` from the dind step in the `Jenkinsfile`, keep the `aws ecr get-login-password` login, and add the AWS CLI to the build image so it is no longer conditional. |
+| 12 | **Jenkins exposure** | `pollSCM` needs no inbound access, so nothing is public today. The moment Jenkins is reachable from outside: replace `loggedInUsersCanDoAnything` with real RBAC, put SSO in front of the local admin user, and add a webhook secret if you swap polling for a webhook. |
 | 13 | **GitHub token** | Revoke the development PAT; use a GitHub App or a dedicated CI secret. |
 | 14 | **kubeconfig** | Remove `--insecure-skip-tls-verify` and restore the CA bundle. |
 | 15 | **LocalStack-only flags** | Remove `DISABLE_CORS_CHECKS`, `DNS_NAME_PATTERNS_TO_RESOLVE_UPSTREAM`, `compress: false`. |
+| 16 | **Privileged builds** | The `jenkins` namespace runs PodSecurity `privileged` so agents can run Docker-in-Docker as root. That is a container-escape surface, and it is the one item here that is a blocker rather than a chore. Move to a rootless builder (kaniko, buildkit rootless) or give agents their own cluster. |
+| 17 | **JENKINS_HOME durability** | It sits on a `local-path` PVC -- node-local, unbacked. Losing the node loses the credential store and every build record. Move to EBS with snapshots, or treat the controller as disposable and keep nothing but JCasC. |
+| 18 | **Plugin versions** | Only the six top-level plugins are pinned in `deployment.yaml`; jenkins-plugin-cli resolves their dependencies and those still float. Capture the full resolved set and list all of it. |
 
 ---
 
