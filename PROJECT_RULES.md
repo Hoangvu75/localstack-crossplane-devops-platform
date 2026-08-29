@@ -233,3 +233,72 @@ worth doing, but not worth doing untested on a live cluster.
 The sibling learn-opensible lab carries the same setting and the same latent trap. It never
 surfaced there because nothing in that repo ever added a pod annotation that a mutating
 webhook reacts to.
+
+## 10. A silent background task is worse than a crash
+
+`history-service` ran for 174 minutes as a pod that was `Running`, had `0` restarts,
+answered `/health` with 200, answered `/ready` with 503, consumed nothing, and logged two
+lines. ArgoCD counted 578 readiness failures against it. The container never restarted,
+because `livenessProbe` hits `/health`, and `/health` only reports that the HTTP server is
+alive — which it was.
+
+The cause was one missing assignment. `record_queue_transit()` read `start_ns` three times
+and never set it, so it raised `NameError` on the first message of every run. Reproduced by
+extracting the function from the live pod's `/app/main.py` and calling it once:
+
+```
+RESULT: raised NameError: name 'start_ns' is not defined
+```
+
+The missing line was a unit conversion, and its comment was still there, orphaned above a
+line that needs no conversion:
+
+```python
+    # Kafka is ms, OTel is ns
+    now_ns = time.time_ns()          # already ns
+```
+
+But the `NameError` was only the trigger. Three separate decisions turned a one-line bug
+into an invisible outage, and each is the real rule:
+
+**Telemetry must never sit in the data path unguarded.** `record_queue_transit()` exists
+only to *describe* the work. It was called outside the `try` that wrapped `json.loads`, so
+a failure to draw a span stopped the service from consuming. A dropped span is a gap in a
+graph; an exception there was a service that stopped working.
+
+**`asyncio.create_task()` without a done-callback discards the exception.** `main()` starts
+the consumer with `create_task(consume())` and never awaits it — correct, because the HTTP
+server must come up even when the broker is down. The cost is that nothing retrieves the
+task's exception, so the traceback went nowhere. Either await it, add
+`task.add_done_callback(...)`, or make the coroutine log its own failure. This one now
+catches, prints the traceback, and reconnects with backoff.
+
+**A readiness flag cleared in a `finally` is a one-way door.** `consume()` set
+`consumer_ready = True`, then its `finally` set it back to `False` on the way out — with no
+loop to set it again. Readiness reported the truth and nothing acted on it: liveness passed,
+so Kubernetes left the pod in place forever.
+
+**Probes must be able to disagree.** `/health` and `/ready` returning the same answer would
+have restarted the pod. They correctly returned different answers, and the result was a pod
+that Kubernetes was content to leave broken indefinitely. If the consumer is the service's
+reason to exist, its death belongs in the liveness signal, not only the readiness one.
+
+The identical missing assignment is in the learn-opensible lab, in a byte-identical
+`main.py`, behind byte-identical probes and OTel annotations. It was never noticed there
+for exactly the reasons above.
+
+## 11. Do not write the CI skip marker in prose
+
+The `[skip ci]` filter in `gitops/platform/tekton/ci/triggers.yaml` tests the whole commit
+message:
+
+```
+!body.head_commit.message.contains('[skip ci]')
+```
+
+The commit that added the git poller *explained* that filter in its body, and the string
+appeared at line 19 of the message. The push was delivered, accepted with `202`, filtered,
+and no build ran. Nothing was broken; the filter did precisely what it says.
+
+GitHub's own webhook sends the full message too, so this is not an artifact of polling —
+name the marker `[skip` + `ci]`, or say "the skip marker", when writing about it.
