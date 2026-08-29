@@ -18,6 +18,19 @@ spec:
       app: web
   template:
     metadata:
+      annotations:
+        # ── Without this the entire frontend is invisible in SigNoz ───────────
+        # Every other Node/Python/Java service carries this annotation; web did not, so
+        # the OTel operator injected no agent and the Next.js app produced no spans at
+        # all. The pod is healthy, the log is clean, and the service simply never appears
+        # on the trace list -- exactly the silent failure README section 9.3 warns about,
+        # arriving by a different route.
+        #
+        # rest-service is the one service that legitimately has no annotation: Go has no
+        # runtime agent, so it is instrumented in code in apps/rest-service/telemetry.go.
+        #
+        # The sibling learn-opensible lab is missing this line too.
+        instrumentation.opentelemetry.io/inject-nodejs: "true"
       labels:
         app: web
     spec:
