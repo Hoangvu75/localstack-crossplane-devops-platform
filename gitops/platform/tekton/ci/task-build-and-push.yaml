@@ -1,21 +1,32 @@
 apiVersion: tekton.dev/v1beta1
 kind: Task
 metadata:
-  name: monorepo-build-and-push
+  name: build-and-push
   namespace: tekton-ci
 spec:
-  description: Builds the six microservice images and pushes them to the LocalStack ECR registry.
+  description: Builds ONE microservice image and pushes it to the LocalStack ECR registry.
   workspaces:
     - name: source
   params:
+    - name: appDir
+      type: string
+      description: Directory under apps/, and the suffix of this app's dind cache PVC.
+    - name: repoSuffix
+      type: string
+      description: >-
+        ECR repository suffix. Equal to appDir for every service except web, which
+        publishes to <project>-web-app.
     - name: registryHost
       type: string
       default: "000000000000.dkr.ecr.us-east-1.localhost.localstack.cloud:4566"
     - name: projectName
       type: string
       default: "learn-crossplane"
+  results:
+    - name: image
+      description: The fully qualified image reference that was pushed.
   steps:
-    - name: build-all-services
+    - name: build-and-push
       image: docker:24.0.7-dind
       securityContext:
         privileged: true
@@ -27,20 +38,44 @@ spec:
         # ── The single most important line in this file ──────────────────────
         # The registry host is 000000000000.dkr.ecr.us-east-1.localhost.localstack.cloud.
         # LocalStack serves a certificate for *.localhost.localstack.cloud, and a TLS
-        # wildcard matches exactly ONE label — so it does not cover a four-label
-        # subdomain. Docker tries HTTPS first, fails verification, and refuses to fall
-        # back to plaintext on its own:
+        # wildcard matches exactly ONE label, so it does not cover a four-label subdomain.
+        # Docker tries HTTPS first, fails verification, and will not fall back to plaintext
+        # on its own:
         #     x509: certificate is valid for *.localhost.localstack.cloud, not
         #     000000000000.dkr.ecr.us-east-1.localhost.localstack.cloud
         #
-        # The k3d nodes do not hit this because LocalStack configures their containerd
-        # with the registry marked insecure when it creates the cluster. A Docker daemon
-        # started by hand inside a pod gets none of that, so it has to be told here.
+        # The k3d nodes do not hit this because LocalStack configures their containerd with
+        # the registry marked insecure when it creates the cluster. A Docker daemon started
+        # by hand inside a pod gets none of that, so it has to be told here.
         - name: DOCKER_INSECURE_REGISTRY
           value: "$(params.registryHost)"
+      # ── Why these numbers, and what they actually control ──────────────────
+      # Six of these Tasks run in parallel, and the memory REQUEST is the throttle. The node
+      # has ~15.5Gi allocatable with ~3.2Gi already requested by everything else, so at 3Gi
+      # apiece roughly four builds are admitted at once and the rest stay Pending until
+      # capacity frees. That is deliberate: Tekton has no maxConcurrency, and Kubernetes
+      # resource requests are the native way to bound it.
+      #
+      # Without a request they would all schedule immediately -- the node reports only 20%
+      # of memory as requested while actually using 71%, because most containers here
+      # declare nothing -- and six simultaneous cold builds would exhaust RAM.
+      #
+      # The limit is higher than the request on purpose: a build that briefly needs more
+      # should get it, and a runaway one should be OOM-killed rather than taking the node
+      # down with it.
+      resources:
+        requests:
+          cpu: "1"
+          memory: 3Gi
+        limits:
+          cpu: "4"
+          memory: 5Gi
       script: |
         #!/usr/bin/env sh
         set -eu
+
+        APP_DIR="$(params.appDir)"
+        REPO_NAME="$(params.projectName)-$(params.repoSuffix)"
 
         # ── --mtu is why this build takes minutes instead of an hour ─────────
         # dockerd defaults its bridge to MTU 1500 and hands 1500 to every build container.
@@ -59,85 +94,51 @@ spec:
         # Read from the pod interface rather than hardcoded, so a change in the CNI or its
         # overhead does not silently reintroduce the same stall.
         POD_MTU=$(cat /sys/class/net/eth0/mtu 2>/dev/null || echo 1450)
-        echo ">>> Starting Docker daemon (insecure registry: ${DOCKER_INSECURE_REGISTRY}, mtu: ${POD_MTU})..."
+        echo ">>> [${APP_DIR}] starting Docker daemon (insecure: ${DOCKER_INSECURE_REGISTRY}, mtu: ${POD_MTU})"
         dockerd-entrypoint.sh --insecure-registry "${DOCKER_INSECURE_REGISTRY}" --mtu="${POD_MTU}" >/tmp/dockerd.log 2>&1 &
 
-        # Bounded wait. The old `until docker info; do sleep 1; done` had no ceiling, so a
-        # daemon that failed to start turned into a task that hung until the PipelineRun
-        # timeout with no diagnostic.
+        # Bounded wait. An unbounded `until docker info` turns a daemon that failed to start
+        # into a Task that hangs until the timeout with no diagnostic.
         i=0
         until docker info >/dev/null 2>&1; do
           i=$((i + 1))
           if [ "$i" -gt 60 ]; then
-            echo "ERROR: docker daemon did not come up in 60s. Daemon log:" >&2
+            echo "ERROR: [${APP_DIR}] docker daemon did not come up in 60s. Daemon log:" >&2
             tail -50 /tmp/dockerd.log >&2
             exit 1
           fi
           sleep 1
         done
-        echo ">>> Docker daemon ready."
 
         COMMIT_SHA=$(cat commit_sha.txt)
         COMMIT_TAG=$(echo "${COMMIT_SHA}" | cut -c 1-7)
-        echo "=== [Tekton CI] Monorepo image build, commit ${COMMIT_TAG} ==="
+        FULL_IMAGE="$(params.registryHost)/${REPO_NAME}:${COMMIT_TAG}"
+
+        echo ">>> [${APP_DIR}] building ${FULL_IMAGE}"
 
         # LocalStack's ECR accepts anonymous pushes, so this login is not what makes the
-        # push work today — it is what stops this task from being the thing that breaks
+        # push work today -- it is what stops this Task from being the thing that breaks
         # when the registry becomes real. Non-fatal on purpose: `aws` is absent from the
-        # dind image, and adding it just for this would double the image pull.
+        # dind image and adding it would double the image pull.
         if command -v aws >/dev/null 2>&1; then
-          echo ">>> Logging in to ECR..."
           aws ecr get-login-password --region us-east-1 --endpoint-url http://localstack:4566 \
             | docker login --username AWS --password-stdin "$(params.registryHost)" || true
         fi
 
-        # apps/<dir>:<ecr repo suffix>. The two differ for exactly one service: apps/web
-        # publishes to learn-crossplane-web-app, matching the ECR Repository name in
-        # gitops/infrastructure/registry/ecr-repositories.yaml.
-        SERVICES="web:web-app cpu-service:cpu-service memory-service:memory-service disk-service:disk-service rest-service:rest-service history-service:history-service"
+        # ── No `|| true` anywhere below ─────────────────────────────────────
+        # This used to end in `docker push ... || echo "Pushed or simulated push"`, which
+        # turned any push failure into a green Task. The pipeline then reported success,
+        # git-update-workloads wrote image tags for images that did not exist, ArgoCD synced
+        # them, and the pods went ImagePullBackOff -- three steps away from the real error.
+        docker build -t "${FULL_IMAGE}" "apps/${APP_DIR}"
+        docker push "${FULL_IMAGE}"
 
-        FAILED=""
-        for item in $SERVICES; do
-          APP_DIR="${item%%:*}"
-          REPO_SUFFIX="${item##*:}"
-          REPO_NAME="$(params.projectName)-${REPO_SUFFIX}"
-          FULL_IMAGE="$(params.registryHost)/${REPO_NAME}:${COMMIT_TAG}"
-
-          echo "------------------------------------------------------------"
-          echo ">>> Building apps/${APP_DIR} -> ${FULL_IMAGE}"
-
-          # ── Why every failure is collected instead of ignored ────────────────
-          # This used to be:  docker push "$FULL_IMAGE" || echo "Pushed or simulated push"
-          # which turned any push failure into a green task. The pipeline then reported
-          # success, git-update-workloads wrote image tags for images that did not exist,
-          # ArgoCD synced them, and the pods went ImagePullBackOff — three steps away from
-          # the actual error. A CI step that cannot fail is not a CI step.
-          #
-          # Failures are accumulated rather than fatal-on-first so that one broken service
-          # still reports the state of the other five in a single run.
-          if ! docker build -t "${FULL_IMAGE}" "apps/${APP_DIR}"; then
-            echo "!!! BUILD FAILED: ${APP_DIR}" >&2
-            FAILED="${FAILED} ${APP_DIR}(build)"
-            continue
-          fi
-          if ! docker push "${FULL_IMAGE}"; then
-            echo "!!! PUSH FAILED: ${FULL_IMAGE}" >&2
-            FAILED="${FAILED} ${APP_DIR}(push)"
-            continue
-          fi
-          echo ">>> OK: ${FULL_IMAGE}"
-        done
-
-        echo "------------------------------------------------------------"
-        if [ -n "${FAILED}" ]; then
-          echo "ERROR: the following services did not publish:${FAILED}" >&2
-          exit 1
-        fi
-        echo "=== All six images built and pushed at tag ${COMMIT_TAG} ==="
+        echo ">>> OK: ${FULL_IMAGE}"
+        printf '%s' "${FULL_IMAGE}" > "$(results.image.path)"
   volumes:
     - name: dind-storage
-      # Was emptyDir, which threw the layer cache away on every run -- see the long note in
-      # ci/dind-cache-pvc.yaml. The PVC is ReadWriteOnce and two dockerd processes must
-      # never share one /var/lib/docker, so do not run two PipelineRuns at once.
+      # Per-app cache. Two dockerd processes must never share one /var/lib/docker, and
+      # these Tasks run in parallel, so a single shared claim would serialise them and let
+      # the six builds evict each other's layers. See ci/dind-cache-pvcs.yaml.
       persistentVolumeClaim:
-        claimName: dind-cache
+        claimName: dind-cache-$(params.appDir)

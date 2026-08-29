@@ -92,6 +92,26 @@ spec:
         # writes the git placeholders straight back, so CloudFront would flap between a
         # working origin and placeholder.elb.localhost.localstack.cloud forever. That is
         # far more confusing than a plain failure.
+        # ── Fields Crossplane writes back into spec, which git will never contain ──
+        # A *Selector is an INPUT. Crossplane resolves it, then persists BOTH the *Ref it
+        # picked and the concrete ARN into spec.forProvider. Git only ever has the
+        # selector, so live and desired differ permanently and the Application sits
+        # OutOfSync forever while being completely correct.
+        #
+        # Only LBListener needs this. Every other kind here uses the same selector pattern
+        # and stays Synced, because ServerSideDiff reconciles a top-level resolved field on
+        # its own. What it cannot handle is the resolved value nested inside an ARRAY --
+        # defaultAction[].targetGroupArn -- which is exactly what LBListener has.
+        #
+        # Do not widen this to the selectors themselves. Those come from git and must keep
+        # being diffed; changing a selector should still show up as drift.
+        - group: elbv2.aws.upbound.io
+          kind: LBListener
+          jqPathExpressions:
+            - .spec.forProvider.loadBalancerArn
+            - .spec.forProvider.loadBalancerArnRef
+            - .spec.forProvider.defaultAction[]?.targetGroupArn
+            - .spec.forProvider.defaultAction[]?.targetGroupArnRef
         - group: cloudfront.aws.upbound.io
           kind: Distribution
           jqPathExpressions:
