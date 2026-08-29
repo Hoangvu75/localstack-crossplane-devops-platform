@@ -262,12 +262,33 @@ timeout(time: 2, unit: 'HOURS') {
                                 ( cd "${WORKLOAD_DIR}" && kustomize edit set image "${REPO_NAME}=${FULL_IMAGE}" )
                             done
 
-                            git config user.email "jenkins-ci@localstack-crossplane.internal"
-                            git config user.name  "Jenkins CI"
+                            # ── --global on all four, and why it is not cosmetic ──
+                            # Build #3 pushed all six images and then died here:
+                            #
+                            #     + git config user.email jenkins-ci@...
+                            #     fatal: not in a git directory
+                            #
+                            # `checkout scm` runs in the jnlp container as uid 1000 and
+                            # creates the workspace and its .git. This sh step runs in the
+                            # tools container, which is root. Git refuses to touch a
+                            # repository owned by a different user, and a `git config`
+                            # without --global has nowhere to write but .git/config, so it
+                            # reports the directory as not a repository at all.
+                            #
+                            # Tekton never hit this because every step of a Task shares one
+                            # container and one user. A Jenkins agent is several containers,
+                            # and they do not agree on who they are.
+                            #
+                            # safe.directory is the other half: without it `git add` and
+                            # `git commit` fail on the same ownership check, one command
+                            # later, with a different message.
+                            git config --global --add safe.directory "$(pwd)"
+                            git config --global user.email "jenkins-ci@localstack-crossplane.internal"
+                            git config --global user.name  "Jenkins CI"
                             # A credential helper rather than https://TOKEN@github.com/...
                             # in the URL: the URL form leaks the token into every error
                             # message and into `git remote -v`.
-                            git config credential.helper \
+                            git config --global credential.helper \
                                 '!f() { echo "username=x-access-token"; echo "password=${GITHUB_TOKEN}"; }; f'
 
                             git add gitops/workloads/
