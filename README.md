@@ -3,7 +3,7 @@
 An end-to-end Kubernetes-native DevOps platform **running entirely on a local machine**:
 
 - **Infrastructure as Code** — declared as Kubernetes custom resources with **Crossplane**, continuously reconciled.
-- **Continuous Integration** — Kubernetes-native pipelines, triggers and dashboard with **Tekton**.
+- **Continuous Integration** — **Jenkins**, configured entirely from git with JCasC: no dashboard clicks, agents as throwaway pods.
 - **Continuous Delivery** — pull-based GitOps with **ArgoCD**, one ApplicationSet.
 - **Microservices** — six services on EKS, served via ALB → CloudFront.
 - **Observability** — **OpenTelemetry Operator + Collector + SigNoz** for traces, logs and metrics.
@@ -43,7 +43,7 @@ flowchart TD
             PC["ProviderConfig to http://localstack:4566"]
         end
 
-        subgraph TEKTON["tekton-pipelines + tekton-ci"]
+        subgraph JENKINS["jenkins"]
             TEK_PIPE["Pipeline: git-clone, build+push, git-update"]
             TEK_TRIG["EventListener + github/CEL interceptors"]
             TEK_DASH["Dashboard (:9097)"]
@@ -79,7 +79,7 @@ flowchart TD
 
     APPSET -->|"sync infrastructure CRs"| CP
     UP_AWS -->|"reconcile, correct drift"| LS
-    APPSET -->|"sync Tekton"| TEKTON
+    APPSET -->|"sync Jenkins"| JENKINS
     APPSET -->|"sync platform"| PLAT
     APPSET -->|"sync workloads"| APPS
 
@@ -95,30 +95,63 @@ Four flows, in order:
 
 1. **Bootstrap** — steps 00 to 04 are imperative on purpose. §3.3 explains which parts cannot be GitOps, and why.
 2. **IaC** — ArgoCD syncs `gitops/infrastructure/`; Crossplane reconciles it into LocalStack and corrects drift.
-3. **CI/CD** — a commit runs the Tekton pipeline, which pushes images to ECR and then **writes the new tags back to git**; ArgoCD deploys them.
+3. **CI/CD** — Jenkins polls git, builds and pushes images to ECR, then **writes the new tags back to git**; ArgoCD deploys them.
 4. **Request** — browser → CloudFront → ALB → ingress-nginx → web / rest-service → the four metric services → Redpanda.
 
 ---
 
-## 1. Why Tekton instead of CodeBuild
+## 1. Why Jenkins, and what the two detours through CodeBuild and Tekton taught
 
-The trigger is the reason. LocalStack's CodeBuild cannot start a build from a git push
-without mocking SNS and Lambda, so `learn-opensible` always kicked builds off by hand.
+This lab has now run its CI on three engines, and the reason for each change was different
+from the reason expected going in.
 
-| | AWS CodeBuild on LocalStack | Tekton |
-| :--- | :--- | :--- |
-| **Execution** | LocalStack's own container wrapper | native Pods and CRDs (`Task`, `Pipeline`, `PipelineRun`) |
-| **Trigger** | needs SNS/Lambda mocking | `EventListener` + `TriggerBinding` + interceptors, built in |
-| **Definition** | `buildspec.yml` | declarative Kubernetes YAML, managed by GitOps like everything else |
-| **UI** | LocalStack container logs | Dashboard with per-step logs and a pipeline graph |
-| **Portability** | AWS only | any Kubernetes cluster |
+**CodeBuild → Tekton.** The stated reason was triggering: LocalStack's CodeBuild cannot
+start a build from a git push without mocking SNS and Lambda, so `learn-opensible` always
+kicked builds off by hand. Tekton was chosen because it ships a complete trigger stack.
 
-**What this lab does and does not deliver on that promise.** The trigger machinery is real
-and wired: interceptors filter the event, a `TriggerTemplate` creates the `PipelineRun`. But
-an `EventListener` on a laptop is not reachable from GitHub, and nothing here registers a
-webhook on the GitHub side. So the trigger is **still manual today**: `make run-ci` starts a
-run. §8.2 covers the three ways to make it genuinely automatic, the loop prevention that
-becomes mandatory the moment you do, and the curl that exercises the interceptor chain.
+That reasoning was half right, and the half that was wrong took nineteen hours of uptime to
+surface. The `EventListener` was healthy the entire time and had never received a single
+event, because it is a ClusterIP inside a k3d cluster on a laptop:
+
+```
+GitHub → home IP → NAT router → Windows → WSL2 → Docker Desktop → k3d → 10.43.x
+```
+
+Nothing on that path forwards inbound. **The blocker was never the CI tool.** CodeBuild
+would sit behind exactly the same NAT. Swapping engines could not fix a reachability
+problem one layer below the engine, and the eventual fix was to invert the direction — poll
+from inside the cluster, which only ever makes outbound calls. ArgoCD in this same cluster
+had been doing precisely that all along.
+
+**Tekton → Jenkins.** The question was whether Jenkins can be configured entirely from git,
+without touching its dashboard. It can, and it reaches further than Tekton does: Tekton
+lets you declare pipelines in YAML but has no controller state to declare, while Jenkins
+has a great deal of it and JCasC declares all of it.
+
+| | CodeBuild on LocalStack | Tekton | Jenkins |
+| :--- | :--- | :--- | :--- |
+| **Pipeline definition** | `buildspec.yml` | `Pipeline` + `Task` CRDs | `Jenkinsfile` |
+| **Controller config** | n/a (managed) | nothing to configure | `casc/jenkins.yaml` (JCasC) |
+| **Job definition** | console or IaC | a `PipelineRun` object | Job DSL, inside the JCasC file |
+| **Build concurrency** | account limits | no `maxConcurrency`; smuggled in as a memory request | `containerCapStr`, stated directly |
+| **Trigger from git** | needs SNS/Lambda mocking | `EventListener` — unreachable behind NAT | `pollSCM`, built in |
+| **Agents** | LocalStack container wrapper | Pods | Pods |
+| **Mutable state** | none | none | `JENKINS_HOME`, and this is the real cost |
+
+**The two things Jenkins does better here** are both consequences of it being older and
+having met these problems already. `containerCapStr: "2"` says what the build concurrency
+limit is; Tekton has no such knob, so the same limit had to be expressed as a memory
+request — which was sized against the wrong resource and cost an entire pipeline to TLS
+handshake timeouts before the mistake was visible (§8.1). And `pollSCM` is one line, where
+Tekton needed a hand-written CronJob to feed its own EventListener from inside the cluster.
+
+**The one thing it does worse** is not fixable by configuration. Tekton kept nothing: a
+`PipelineRun` was a disposable object and every definition was a manifest. Jenkins writes
+job definitions, build history, plugin state and its credential store to `JENKINS_HOME`,
+and anything changed through the UI is persisted there and silently diverges from git until
+the next reload. JCasC reasserts the configuration on every boot, which narrows the window
+but does not close it. That is the honest price of this migration, and no amount of YAML
+removes it.
 
 ---
 
@@ -150,7 +183,7 @@ learn-crossplane/
 │   │   ├── ingress-nginx/               wave 0   NodePort 30080
 │   │   ├── cert-manager/                wave 5   issues the OTel operator webhook cert
 │   │   ├── localstack-wiring/           wave 4   CronJob: ALB target + CF/Route53 wiring
-│   │   ├── tekton/                      wave 8   Pipelines, Triggers, Dashboard (all vendored)
+│   │   ├── jenkins/                     wave 8   controller + JCasC + agent RBAC (no chart, plain manifests)
 │   │   ├── redpanda/                    wave 12  Kafka-compatible queue
 │   │   ├── otel-operator/               wave 15  injects auto-instrumentation agents
 │   │   ├── signoz/                      wave 22  observability backend
@@ -198,9 +231,9 @@ LOCALSTACK_PAT=your_localstack_pro_token
 GITHUB_TOKEN=your_github_token
 ```
 
-Then push this repository to GitHub. **ArgoCD and the Tekton pipeline both clone from
+Then push this repository to GitHub. **ArgoCD and Jenkins both clone from
 GitHub, never from your working copy** — the repo URL is set in `gitops/bootstrap/appset.yaml`
-and `gitops/platform/tekton/ci/pipeline.yaml`. Local edits do nothing until they are pushed.
+and the `Jenkinsfile`. Local edits do nothing until they are pushed.
 
 ### 3.3 What runs imperatively, and why
 
@@ -294,11 +327,10 @@ AWS itself, so whatever it prints is what the last reconcile actually saw.
 | Component | Address | How |
 | :--- | :--- | :--- |
 | **ArgoCD** | `http://<argocd-alb-dns>:4566/` | its own ALB, NodePort 30081 — user `admin`, password from `scripts/verify-web-access.sh`. `kubectl -n argocd port-forward svc/argocd-server 8080:80` also works. |
-| **Tekton Dashboard** | `http://localhost:9097` | `kubectl -n tekton-pipelines port-forward svc/tekton-dashboard 9097:9097` |
+| **Jenkins** | `http://localhost:8080` | `kubectl -n jenkins port-forward svc/jenkins 8080:8080` — user `admin`, password from `make verify` |
 | **SigNoz** | `http://<signoz-alb-dns>:4566/` | its own ALB, NodePort 30083. No generated password: the first visit asks you to create an account. |
 | **Web app via ALB** | `http://<alb-dns>:4566/` | ALB DNS name printed by steps 04 and 05 |
 | **Web app via CloudFront** | `http://<dist-id>.cloudfront.localhost.localstack.cloud:4566/` | printed by step 04 |
-| **Tekton webhook** | `http://<alb-dns>:4566/tekton-webhook` | POST only; this is the URL to aim a tunnel at |
 | **LocalStack gateway** | `http://localhost:4566` | |
 
 Every address above is assigned by LocalStack at creation time and changes whenever the
@@ -358,7 +390,7 @@ tractable — see PROJECT_RULES §2.
 | CloudFront returns blank responses | The origin defaults to port 80 | `customOriginConfig.httpPort: 4566` |
 | CloudFront serves blank HTML in a browser while `curl` works | The proxy returns an uncompressed body with `Content-Encoding: gzip` | `compress: false` in `apps/web/next.config.js` |
 | `www.learn-crossplane.internal` returns 200 with an empty body | **The gateway routes by its own static hostname patterns and never consults Route53 records** | Use the ALB or CloudFront domain directly |
-| An Ingress host like `tekton.localhost.localstack.cloud` never reaches the cluster | Same cause — the gateway has no knowledge of an Ingress inside k3d | `port-forward`, or a path rule on the host-less Ingress reached through the ALB |
+| An Ingress host like `jenkins.localhost.localstack.cloud` never reaches the cluster | Same cause — the gateway has no knowledge of an Ingress inside k3d | `port-forward`, or a path rule on the host-less Ingress reached through the ALB |
 
 ### 6.4 CSRF protection
 
@@ -411,96 +443,127 @@ repo-server, with an error that looks nothing like DNS.
 
 ### 8.1 The pipeline
 
-`gitops/platform/tekton/ci/pipeline.yaml`. One clone, six parallel builds, one write-back:
+`Jenkinsfile` at the repository root. One checkout, six parallel builds, one write-back:
 
 ```
                       ┌─ build-web ─────────────┐
                       ├─ build-cpu-service ─────┤
-  fetch-repository ──►├─ build-memory-service ──┤──► update-gitops-manifests
+  Checkout ──────────►├─ build-memory-service ──┤──► Update GitOps manifests
                       ├─ build-disk-service ────┤
                       ├─ build-rest-service ────┤
                       └─ build-history-service ─┘
 ```
 
-The six declare `runAfter: [fetch-repository]` and nothing else, which is what makes Tekton
-run them concurrently. **How many actually run at once is set by the memory request on the
-Task, not by the Pipeline** — Tekton has no `maxConcurrency`, so Kubernetes resource requests
-are the native throttle. At 3Gi apiece on a node with ~15.5Gi allocatable, roughly four run
-together and the rest wait. Each build also has its **own** layer-cache PVC, so changing one
-service leaves the other five hitting cache and finishing in seconds.
+Each branch runs in its own throwaway pod with a privileged `dind` container and its own
+layer-cache PVC, so changing one service leaves the other five hitting cache.
 
-`update-gitops-manifests` runs after all six, deliberately: writing a tag for an image that
-was never pushed is how you get `ImagePullBackOff` behind a green pipeline.
+**How many run at once is stated, not inferred.** `containerCapStr: "2"` in
+`gitops/platform/jenkins/casc/jenkins.yaml` caps the cloud at two agent pods. This is the
+clearest single improvement over the Tekton arrangement, and the reason is a failure worth
+keeping:
 
-The three task definitions:
+Tekton has no `maxConcurrency`, so the limit had to be smuggled in as a memory request —
+3Gi apiece on a ~15.5Gi node admitted about four. Run `monorepo-ci-run-8pwbv` then split
+itself into a clean natural experiment:
 
-1. **`git-clone`** — checks out the revision. It accepts a branch, a tag, **or a full commit
-   SHA**, and detects which it was given. This matters: the `TriggerBinding` feeds it
-   `body.head_commit.id`, and `git clone --branch <sha>` is not a thing — `--branch` accepts
-   only a branch or a tag. That single mismatch meant every webhook-driven run died at step
-   one, while manual runs, which pass `main`, worked perfectly.
-2. **`build-and-push`** — one service per invocation, in a privileged dind step, pushing
-   them to LocalStack ECR tagged with the 7-character short SHA. Failures are collected per
-   service and the task exits non-zero. It previously ended in
-   `docker push … || echo "Pushed or simulated push"`, which made every push failure a green
-   build; the missing images were then referenced by tag, synced, and surfaced as
-   `ImagePullBackOff` three steps away from the actual error.
-3. **`git-update-workloads`** — runs `kustomize edit set image` in each
-   `gitops/workloads/<service>/` directory and pushes the commit. **This is the handover from
-   CI to CD**: ArgoCD watches git, not ECR, so an image nobody wrote a tag for is an image
-   nobody deploys.
+```
+4 pods started together at 05:57:02-03   ALL FOUR FAILED
+2 pods started at 06:01:08-10, alone     BOTH SUCCEEDED
+```
 
-The token comes from the `git-credentials` Secret created by step 03. If it is missing the
-task fails loudly rather than skipping — the earlier version printed `Skipping git push` and
-exited 0, so CI and CD were never actually connected and nothing said so.
+with every failure identical, and naming the wrong subsystem:
 
-One `kustomization.yaml` per service, so two concurrent builds cannot clobber each other.
+```
+ERROR: failed to solve: node:20-alpine: failed to do request:
+Head "https://registry-1.docker.io/v2/library/node/manifests/20-alpine":
+net/http: TLS handshake timeout
+```
 
-### 8.2 Triggering — what works and what does not
+Not MTU — the daemon logged `mtu: 1450` and it was correct. Four Docker-in-Docker daemons
+pulling base images at once, through LocalStack's DNS and Docker Desktop's NAT, cannot
+finish their TLS handshakes. The tell was in the trivial steps: `load .dockerignore` moved
+2 bytes in 9.2 seconds. **The binding constraint is the network, and the throttle had been
+sized against memory.** Expressing it as a request meant the number could be wrong without
+anyone noticing until a whole pipeline died.
 
-**Works today:** `make run-ci` creates a `PipelineRun` directly. To exercise the
-interceptors as well — which is what you want before wiring a real webhook — POST a
-GitHub-shaped payload at the listener:
+Three constraints carried over from Tekton unchanged, because they are properties of this
+environment rather than of the CI engine:
+
+1. **`--insecure-registry`.** The ECR host is a four-label subdomain of
+   `localhost.localstack.cloud`, and a TLS wildcard matches exactly one label, so
+   LocalStack's certificate does not cover it. Docker tries HTTPS, fails verification, and
+   will not fall back on its own. The k3d nodes do not hit this because LocalStack marks
+   the registry insecure in their containerd config when it creates the cluster; a daemon
+   started by hand inside a pod inherits none of that.
+2. **`--mtu` read from `/sys/class/net/eth0/mtu`.** flannel VXLAN leaves the pod interface
+   at 1450. dockerd defaults its bridge to 1500 and everything between 1451 and 1500 bytes
+   is silently dropped. The symptom is deceptive: DNS answers instantly because queries are
+   small UDP, while every TLS handshake and bulk transfer stalls — `npm ci` for `apps/web`
+   once took 47 minutes and exited 0 with an empty `node_modules`.
+3. **No `|| true` after `docker push`.** An earlier version ended in
+   `docker push … || echo "pushed or simulated"`, which made every push failure a green
+   build. Image tags were then written for images that did not exist, ArgoCD synced them,
+   and the pods went `ImagePullBackOff` — three steps from the real error.
+
+**The write-back is the handover from CI to CD.** The final stage runs
+`kustomize edit set image` in each `gitops/workloads/<service>/` directory and pushes the
+commit. ArgoCD watches git, not ECR, so an image nobody wrote a tag for is an image nobody
+deploys. It is deliberately all-or-nothing: it is only reached when all six builds
+succeeded, because writing a tag for an image that was never pushed is the failure above.
+
+### 8.2 Triggering — why polling, and why that is not a workaround
+
+`pollSCM('H/2 * * * *')`, declared in the Job DSL inside `casc/jenkins.yaml`. Jenkins asks
+GitHub every two minutes whether `main` has moved.
+
+**Why not a webhook.** Because a webhook cannot arrive. The cluster is a k3d container
+inside Docker Desktop inside WSL2 on a laptop behind NAT, and an inbound connection from
+GitHub would have to traverse:
+
+```
+GitHub → home IP → NAT router → Windows → WSL2 → Docker Desktop → k3d → 10.43.x
+```
+
+Nothing on that path forwards inbound. This is worth stating plainly because the previous
+engine was chosen partly to fix triggering: Tekton's `EventListener` was complete, healthy,
+and **had received zero events in nineteen hours of uptime**. The machinery was never the
+problem. Polling inverts the direction — only outbound connections, which NAT does not
+obstruct — and it is what ArgoCD in this same cluster has always done to detect git
+changes.
+
+The cost is honest and small: up to one poll interval of latency instead of instant.
+
+**To move to real webhooks**, put a tunnel in front of Jenkins
+(`cloudflared tunnel --url http://<jenkins-alb>:4566`), register the public URL as a
+webhook on the repo, and add the `github` plugin. Do not do that without authentication in
+front of it first.
+
+**The loop, and why the filter is not optional.** The last stage pushes a commit to `main`.
+Polling would see that commit and build again, forever. Two things stop it and **both** are
+required:
+
+- the commit message carries the skip marker;
+- the SCM extension in `casc/jenkins.yaml` reads it:
+
+```groovy
+messageExclusion {
+  excludedMessage('(?s).*\\[skip ci\\].*')
+}
+```
+
+The marker alone is decoration, and the filter alone has nothing to match.
+
+`(?s)` makes `.` match newlines, so the marker is tested against the **whole** message,
+exactly as GitHub's webhook payload would be. A commit that merely *discusses* the marker
+in its body is therefore also skipped — not a bug, and it has bitten this repo once
+already. See `PROJECT_RULES.md` rule 11.
+
+**When a push produces no build**, the reason is in the job's polling log, not the build
+log:
 
 ```bash
-kubectl -n tekton-ci port-forward svc/el-ci-webhook-listener 8089:8080 &
-curl -X POST http://127.0.0.1:8089 -H 'X-GitHub-Event: push' -H 'Content-Type: application/json' \
-  -d '{"ref":"refs/heads/main","head_commit":{"id":"'"$(git rev-parse HEAD)"'","message":"test"},"repository":{"clone_url":"https://github.com/Hoangvu75/localstack-crossplane-devops-platform.git"}}'
-```
-
-All three fields matter: `X-GitHub-Event` satisfies the github interceptor, and `ref` plus
-`head_commit.message` are what the CEL filter reads. Drop the message and the expression
-errors instead of filtering.
-
-**Does not work today:** GitHub calling the listener. It is not reachable from the internet
-and no webhook is registered. Three ways to fix that, cheapest first:
-
-| Option | How | Trade-off |
-| :--- | :--- | :--- |
-| **Tunnel** | `cloudflared tunnel --url http://<alb-dns>:4566/tekton-webhook`, then add the public URL as a webhook on the GitHub repo | Real push-based CI. **Add `secretRef` to the github interceptor first** — an open listener builds and pushes whatever anyone POSTs to it. |
-| **Polling** | A `CronJob` comparing `origin/main` against the last built SHA and creating a `PipelineRun` on change. `gitops/platform/localstack-wiring/` is the template to copy: same shape, same RBAC pattern, one more `ClusterRole` rule for `pipelineruns`. | No inbound exposure. Latency equal to the poll interval. Must read the head commit message so `[skip ci]` still breaks the loop. |
-| **Local git hook** | `.git/hooks/pre-push` running the curl above | Zero infrastructure. Only fires for pushes from your machine. |
-
-**The loop, and why the filter is not optional.** The last task pushes a commit to `main`.
-With a live webhook that push triggers a build, which pushes again — unbounded. Two things
-stop it and both are required:
-
-- the commit message carries `[skip ci]`;
-- the CEL interceptor in `ci/triggers.yaml` reads it:
-
-```
-body.ref == 'refs/heads/main' && has(body.head_commit) && !body.head_commit.message.contains('[skip ci]')
-```
-
-The marker alone is decoration — before the filter existed, nothing read it. `has(...)`
-guards branch-deletion and tag events, where `head_commit` is null and dereferencing
-`.message` errors out instead of filtering.
-
-When an event is accepted but no `PipelineRun` appears, the reason is only in the listener's
-own log:
-
-```bash
-kubectl -n tekton-ci logs -l eventlistener=ci-webhook-listener --tail=50
+kubectl -n jenkins exec deploy/jenkins -- \
+  cat /var/jenkins_home/jobs/monorepo-ci/scm-polling.log
 ```
 
 ---

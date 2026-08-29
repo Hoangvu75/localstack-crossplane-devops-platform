@@ -12,10 +12,23 @@
 // written out statically, which would mean six near-identical copies of the same
 // twenty lines.
 
+// ── @Field, not a bare assignment and not `def` ──────────────────────────────
+// A bare `SERVICES = [...]` at script level writes into the script binding, and Jenkins
+// says so on every run:
+//
+//     Did you forget the `def` keyword? WorkflowScript seems to be setting a field named
+//     SERVICES (to a value of type ArrayList) which could lead to memory leaks
+//
+// It is not pedantry: binding entries are serialised with the pipeline state at every CPS
+// checkpoint. Plain `def` is not the fix either -- that scopes the variable to the script
+// body, where the buildService() method below cannot see it. @Field is what Jenkins
+// documents for exactly this case: shared between methods, and a real field.
+import groovy.transform.Field
+
 // appDir is the directory under apps/ AND the suffix of that service's cache PVC.
 // repoSuffix is the ECR repository name after the project prefix. The two differ for
 // exactly one service: apps/web publishes to learn-crossplane-web-app.
-SERVICES = [
+@Field final List SERVICES = [
     [dir: 'web',             repo: 'web-app'],
     [dir: 'cpu-service',     repo: 'cpu-service'],
     [dir: 'memory-service',  repo: 'memory-service'],
@@ -24,9 +37,9 @@ SERVICES = [
     [dir: 'history-service', repo: 'history-service'],
 ]
 
-REGISTRY = '000000000000.dkr.ecr.us-east-1.localhost.localstack.cloud:4566'
-PROJECT  = 'learn-crossplane'
-BRANCH   = 'main'
+@Field final String REGISTRY = '000000000000.dkr.ecr.us-east-1.localhost.localstack.cloud:4566'
+@Field final String PROJECT  = 'learn-crossplane'
+@Field final String BRANCH   = 'main'
 
 // ── One agent pod per service ────────────────────────────────────────────────
 // How many run at once is NOT decided here. casc/jenkins.yaml sets containerCapStr: "2"
@@ -35,6 +48,29 @@ BRANCH   = 'main'
 // resource and cost a whole pipeline -- see the note in casc/jenkins.yaml.
 def buildService(svc, commitTag) {
     return {
+        // ── retry(2), and the failure that earned it ─────────────────────────
+        // Pushing to LocalStack's ECR is transiently unreliable while several builds are
+        // running. Build #2 lost two branches this way, and the message points at the
+        // registry rather than at the load:
+        //
+        //     + docker push .../learn-crossplane-web-app:42f71d2
+        //     Get "http://000000000000.dkr.ecr.../v2/": net/http: request canceled
+        //     (Client.Timeout exceeded while awaiting headers)
+        //
+        // Both images had already BUILT and been tagged; only the registry ping timed
+        // out. The endpoint itself was fine -- the same request, same IP, with the ECR
+        // Host header, answers 200 in under a second when the node is idle. LocalStack is
+        // one Python process, and two DinD daemons pushing layers while six npm installs
+        // compete for I/O is enough to starve it.
+        //
+        // The Tekton pipeline had `retries: 2` on each build task for exactly this, added
+        // after the same class of failure. It was not carried across when this file was
+        // written, and build #2 is what that omission cost.
+        //
+        // Wrapped around the whole podTemplate rather than around the shell step: a retry
+        // gets a clean pod and a freshly started daemon. The layer cache lives on the PVC,
+        // so a second attempt re-uses everything and only redoes the push.
+        retry(2) {
         podTemplate(
             namespace: 'jenkins',
             serviceAccount: 'jenkins',
@@ -137,6 +173,7 @@ def buildService(svc, commitTag) {
                     '''
                 }
             }
+        }
         }
     }
 }

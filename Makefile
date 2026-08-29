@@ -60,9 +60,9 @@ status:
 	@echo "── Workloads ────────────────────────────────────────────────"
 	-@kubectl -n devops-apps get pods
 	@echo ""
-	@echo "── Tekton CI ────────────────────────────────────────────────"
-	-@kubectl -n tekton-ci get secret git-credentials
-	-@kubectl -n tekton-ci get pipelinerun
+	@echo "── Jenkins CI ───────────────────────────────────────────────"
+	-@kubectl -n jenkins get secret git-credentials jenkins-secrets
+	-@kubectl -n jenkins get pods
 	@echo ""
 	@echo "── Entry URLs, from the last localstack-wiring run ──────────"
 	-@kubectl -n localstack-wiring logs -l app=localstack-wiring --tail=20
@@ -73,11 +73,18 @@ status:
 verify:
 	@bash scripts/verify-web-access.sh
 
-# Start the pipeline by hand. The manifest is the same one the TriggerTemplate renders,
-# so this exercises the real Pipeline but skips the interceptor chain — README §8.2 has
-# the curl that tests the interceptors too.
+# Start the pipeline by hand, without waiting for the two-minute poll.
+#
+# Jenkins needs no manifest for this: the job already exists, created by JCasC at boot.
+# The POST goes through the same job, the same Jenkinsfile and the same agent pods as a
+# polled run -- the only thing it skips is the SCM poll that would have noticed the
+# commit. Note that it therefore ALSO skips the [skip ci] check, which lives in the
+# polling path: this will happily rebuild a commit polling would have ignored.
 run-ci:
-	@kubectl create -f gitops/platform/tekton/ci/pipelinerun-manual.yaml
+	@JPW=$$(kubectl -n jenkins get secret jenkins-secrets -o jsonpath="{.data.adminPassword}" | base64 -d); \
+	kubectl -n jenkins exec deploy/jenkins -c jenkins -- \
+	  curl -s -o /dev/null -w "  build queued: HTTP %{http_code}\n" \
+	  -u "admin:$$JPW" -X POST http://localhost:8080/job/monorepo-ci/build
 
 # Keeps ./data/localstack, so the next `make up` resumes from the persisted state.
 destroy:
