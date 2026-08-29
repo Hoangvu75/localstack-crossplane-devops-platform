@@ -127,6 +127,69 @@ data:
       echo "patched route53 alias: ${CUR_ALIAS:-unset} -> ${ALB_DNS}"
     fi
 
+    # ── Adopting the ALB listeners, and the runaway this stops ──────────────
+    # Every LBListener in this repo was stuck in AsyncCreateFailure from the day the
+    # cluster was built, creating a duplicate listener roughly every 90 seconds. Measured
+    # before this loop existed:
+    #
+    #     learn-crossplane-alb          844 listeners
+    #     learn-crossplane-argocd-alb   855
+    #     learn-crossplane-signoz-alb   769
+    #     describe-listeners            5063ms   (this CronJob calls it every 2 minutes)
+    #
+    # The cause is two server-side-apply managers writing one field:
+    #
+    #     manager=argocd-controller                                   op=Apply
+    #     manager=managed.crossplane.io/api-simple-reference-resolver op=Apply
+    #
+    # defaultAction is an ATOMIC array, so an apply replaces the list instead of merging
+    # into it. Each manager drops what the other wrote, the CRD rejects the result, and
+    # the provider can never record the listener's ARN in crossplane.io/external-name.
+    #
+    # Why that is fatal for THIS resource and harmless for its siblings: an ELBv2 listener
+    # has no name. LB and LBTargetGroup both do, so when the same lost-response failure hit
+    # them they re-found their own resources by name on the next reconcile and recovered on
+    # their own -- observed, both of them, during the Jenkins migration. A listener can only
+    # be found by ARN, so a lost external-name is unrecoverable: Crossplane cannot ask AWS
+    # "where is mine?", concludes it does not exist, and creates another.
+    #
+    # Writing the ARN back is therefore the whole fix, and it is the same shape as the two
+    # patches above: a value that cannot exist in git, read off the live API and put where
+    # the controller expects it. Verified with a controlled comparison over six minutes:
+    #
+    #     jenkins-alb (annotated)   2 -> 2    +0
+    #     signoz-alb  (not yet)   837 -> 841  +4
+    #
+    # On real AWS this bug would have announced itself within the hour -- the quota is 50
+    # listeners per ALB, so the 51st CreateListener fails loudly. LocalStack enforces no
+    # quota, which is the only reason it reached 855 in silence. See README section 6.
+    #
+    # `|| true` on the annotate: a listener that genuinely has not been created yet has no
+    # ARN, and this loop must not fail the CronJob over a resource that is simply not ready.
+    for LSN in "${PROJECT}-alb-listener:${PROJECT}-alb" \
+               "${PROJECT}-argocd-listener:${PROJECT}-argocd-alb" \
+               "${PROJECT}-jenkins-listener:${PROJECT}-jenkins-alb" \
+               "${PROJECT}-signoz-listener:${PROJECT}-signoz-alb"; do
+      LSN_MR="${LSN%%:*}"
+      LSN_LB="${LSN##*:}"
+      CUR_EN=$(kubectl get lblisteners.v1beta1.elbv2.aws.upbound.io "${LSN_MR}" \
+        -o jsonpath='{.metadata.annotations.crossplane\.io/external-name}' 2>/dev/null || echo "")
+      case "${CUR_EN}" in
+        arn:*) continue ;;   # already adopted, nothing to do
+      esac
+      LB_ARN=$(aws elbv2 describe-load-balancers --names "${LSN_LB}" \
+        --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null || echo "")
+      [ -z "${LB_ARN}" ] || [ "${LB_ARN}" = "None" ] && continue
+      # Listeners[0]: they are identical duplicates of one another, so any of them is the
+      # right answer. Adopting one stops the rest from being created.
+      LSN_ARN=$(aws elbv2 describe-listeners --load-balancer-arn "${LB_ARN}" \
+        --query 'Listeners[0].ListenerArn' --output text 2>/dev/null || echo "")
+      [ -z "${LSN_ARN}" ] || [ "${LSN_ARN}" = "None" ] && continue
+      kubectl annotate lblisteners.v1beta1.elbv2.aws.upbound.io "${LSN_MR}" \
+        crossplane.io/external-name="${LSN_ARN}" --overwrite >/dev/null 2>&1 || true
+      echo "adopted listener ${LSN_MR} -> ${LSN_ARN##*/}"
+    done
+
     # Printed every loop so `make status`, which tails this log, always has the current
     # entry URLs without querying anything itself.
     CF_DOMAIN=$(kubectl get distributions.v1beta1.cloudfront.aws.upbound.io "${CF_MR}" -o jsonpath='{.status.atProvider.domainName}' 2>/dev/null || echo "")
