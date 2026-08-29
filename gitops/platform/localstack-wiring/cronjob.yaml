@@ -204,12 +204,26 @@ data:
     # If a listener has not been adopted yet, this loop skips the ALB entirely rather than
     # guessing. The adoption loop runs first and will have annotated it by the next tick.
     #
-    # ── Bounded per run ─────────────────────────────────────────────────────
-    # At most 200 deletions per ALB per run. With hundreds of listeners the ELBv2 API
-    # slows to seconds per call -- measured at 5063ms for describe-listeners against 850 --
-    # and an unbounded loop would run past the CronJob's deadline and be killed halfway.
-    # Bounded means several runs to drain a large backlog, which is fine: it is a
-    # background chore, and the count printed each run shows it converging.
+    # ── Bounded by TIME, not by a count ─────────────────────────────────────
+    # The first version capped deletions at 200 per ALB. That was measured wrong: with
+    # hundreds of listeners the ELBv2 API slows to seconds per call, 200 deletions took
+    # longer than the whole job is allowed, and the run was killed at
+    # activeDeadlineSeconds: 300 having cleaned exactly one of the four ALBs:
+    #
+    #     listeners learn-crossplane-alb: 56 found, 55 pruned, keeping 710b6c93
+    #     <job killed, FailureTarget>
+    #
+    # A fixed count cannot be right, because how long a deletion takes depends on how many
+    # listeners are left -- the thing being fixed. A wall-clock budget is self-tuning: it
+    # prunes hard while the API is fast and backs off while it is slow, and it always
+    # leaves the job time to finish and report.
+    #
+    # 180s of the 300s deadline, leaving room for the target registration, CloudFront,
+    # Route53 and adoption work that runs before this. Draining a large backlog then takes
+    # several runs, which is correct for a background chore -- the count printed each run
+    # shows it converging.
+    PRUNE_BUDGET=180
+    PRUNE_START=$(date +%s)
     for LSN in "${PROJECT}-alb-listener:${PROJECT}-alb" \
                "${PROJECT}-argocd-listener:${PROJECT}-argocd-alb" \
                "${PROJECT}-jenkins-listener:${PROJECT}-jenkins-alb" \
@@ -233,7 +247,9 @@ data:
       DELETED=0
       for ARN in ${ALL}; do
         [ "${ARN}" = "${KEEP}" ] && continue
-        [ "${DELETED}" -ge 200 ] && break
+        # Checked every iteration rather than once per ALB: a single delete can take
+        # seconds when the backlog is large, so a per-ALB check would overshoot.
+        [ $(( $(date +%s) - PRUNE_START )) -ge "${PRUNE_BUDGET}" ] && break
         aws elbv2 delete-listener --listener-arn "${ARN}" >/dev/null 2>&1 && DELETED=$((DELETED + 1))
       done
       # Printed even when it deletes nothing, so a run that finds 1 is visible proof the
