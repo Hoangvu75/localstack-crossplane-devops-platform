@@ -190,6 +190,57 @@ data:
       echo "adopted listener ${LSN_MR} -> ${LSN_ARN##*/}"
     done
 
+    # ── Janitor: delete duplicate listeners, keep the ADOPTED one ───────────
+    # Defence in depth, not the fix. The adoption loop above is what stops new
+    # duplicates; this cleans up whatever was created before it ran, and would catch a
+    # regression if the adoption ever silently stopped working.
+    #
+    # ── Which one to keep, and why it is not "the first" ────────────────────
+    # It keeps the listener whose ARN is in crossplane.io/external-name, NOT
+    # Listeners[0]. Those are usually the same and occasionally are not, and deleting the
+    # adopted one would re-arm the exact bug this exists to contain: Crossplane would look
+    # for its listener, not find it, and start creating again every 90 seconds.
+    #
+    # If a listener has not been adopted yet, this loop skips the ALB entirely rather than
+    # guessing. The adoption loop runs first and will have annotated it by the next tick.
+    #
+    # ── Bounded per run ─────────────────────────────────────────────────────
+    # At most 200 deletions per ALB per run. With hundreds of listeners the ELBv2 API
+    # slows to seconds per call -- measured at 5063ms for describe-listeners against 850 --
+    # and an unbounded loop would run past the CronJob's deadline and be killed halfway.
+    # Bounded means several runs to drain a large backlog, which is fine: it is a
+    # background chore, and the count printed each run shows it converging.
+    for LSN in "${PROJECT}-alb-listener:${PROJECT}-alb" \
+               "${PROJECT}-argocd-listener:${PROJECT}-argocd-alb" \
+               "${PROJECT}-jenkins-listener:${PROJECT}-jenkins-alb" \
+               "${PROJECT}-signoz-listener:${PROJECT}-signoz-alb"; do
+      LSN_MR="${LSN%%:*}"
+      LSN_LB="${LSN##*:}"
+      KEEP=$(kubectl get lblisteners.v1beta1.elbv2.aws.upbound.io "${LSN_MR}" \
+        -o jsonpath='{.metadata.annotations.crossplane\.io/external-name}' 2>/dev/null || echo "")
+      case "${KEEP}" in
+        arn:*) ;;
+        *) continue ;;   # not adopted yet -- do not guess which one to keep
+      esac
+      LB_ARN=$(aws elbv2 describe-load-balancers --names "${LSN_LB}" \
+        --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null || echo "")
+      [ -z "${LB_ARN}" ] || [ "${LB_ARN}" = "None" ] && continue
+      ALL=$(aws elbv2 describe-listeners --load-balancer-arn "${LB_ARN}" \
+        --query 'Listeners[].ListenerArn' --output text 2>/dev/null | tr '\t' '\n' || echo "")
+      TOTAL=$(printf '%s\n' "${ALL}" | grep -c '^arn:' || true)
+      [ "${TOTAL:-0}" -le 1 ] && continue
+
+      DELETED=0
+      for ARN in ${ALL}; do
+        [ "${ARN}" = "${KEEP}" ] && continue
+        [ "${DELETED}" -ge 200 ] && break
+        aws elbv2 delete-listener --listener-arn "${ARN}" >/dev/null 2>&1 && DELETED=$((DELETED + 1))
+      done
+      # Printed even when it deletes nothing, so a run that finds 1 is visible proof the
+      # adoption is holding rather than an absence of output that could mean anything.
+      echo "listeners ${LSN_LB}: ${TOTAL} found, ${DELETED} pruned, keeping ${KEEP##*/}"
+    done
+
     # Printed every loop so `make status`, which tails this log, always has the current
     # entry URLs without querying anything itself.
     CF_DOMAIN=$(kubectl get distributions.v1beta1.cloudfront.aws.upbound.io "${CF_MR}" -o jsonpath='{.status.atProvider.domainName}' 2>/dev/null || echo "")
