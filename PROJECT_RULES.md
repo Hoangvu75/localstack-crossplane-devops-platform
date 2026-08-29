@@ -179,3 +179,57 @@ kubectl -n tekton-ci delete pipelinerun <old-run>   # takes its TaskRuns, pods a
 The six `dind-cache-*` claims are NOT in that category. They are declared in git, they are
 the reason a rebuild takes seconds instead of minutes, and deleting one only costs the next
 build its cache.
+
+## 9. `Synced` does not always mean applied
+
+The ApplicationSet sets `argocd.argoproj.io/compare-options: ServerSideDiff=true` on every
+Application. It is there for a real reason — Helm-rendered manifests emit empty fields that
+Kubernetes strips on write, and the default text diff never converges on them — but it has
+a failure mode worth knowing.
+
+ServerSideDiff runs a server-side apply **dry run** and compares the predicted result. Any
+mutating webhook in the path runs during that dry run, and ArgoCD then tries to subtract
+the webhook's changes back out. When it gets that subtraction wrong it can conclude there
+is no diff at all.
+
+Observed, twice, in different shapes:
+
+- `Deployment/tekton-pipelines-remote-resolvers` produced
+  `ComparisonError: error reverting webhook removed fields ... associative list with keys
+  has an element that omits key field`, which blocked the sync outright. Visible, at least.
+- Adding `instrumentation.opentelemetry.io/inject-nodejs` to the web Deployment produced no
+  error at all. The Application reported **Synced at the correct commit**, `kubectl
+  kustomize` rendered the annotation correctly, and the live Deployment simply did not have
+  it. The OpenTelemetry operator's mutating webhook sits in that path for everything in
+  `devops-apps`.
+
+The second one is the dangerous shape: a change that is committed, pushed, rendered and
+reported green, and never applied.
+
+**How to tell.** Compare the rendered manifest with the live object rather than trusting
+the status column:
+
+```bash
+kubectl kustomize gitops/workloads/web | grep -A3 'template:'
+kubectl -n devops-apps get deploy web -o jsonpath='{.spec.template.metadata.annotations}'
+```
+
+**How to fix it now.** A refresh only recomputes the diff, so it changes nothing. Force an
+apply:
+
+```bash
+kubectl -n argocd patch application web --type merge \
+  -p '{"operation":{"initiatedBy":{"username":"admin"},"sync":{"revision":"HEAD","syncStrategy":{"apply":{"force":true}}}}}'
+```
+
+The annotation landed and the pod was rolled within twenty seconds.
+
+**Why it is not simply turned off.** ServerSideDiff is what keeps SigNoz, cert-manager and
+ingress-nginx from sitting OutOfSync forever. Disabling it globally trades a rare silent
+failure for a permanent noisy one. Narrowing it to the components that need it means an
+extra field in all 23 `config.yaml` files or a conditional in the ApplicationSet template —
+worth doing, but not worth doing untested on a live cluster.
+
+The sibling learn-opensible lab carries the same setting and the same latent trap. It never
+surfaced there because nothing in that repo ever added a pod annotation that a mutating
+webhook reacts to.
