@@ -25,4 +25,4 @@ labels:
 images:
 - name: learn-crossplane-rest-service
   newName: 000000000000.dkr.ecr.us-east-1.localhost.localstack.cloud:4566/learn-crossplane-rest-service
-  newTag: 2d00b91
+  newTag: f064ad1
