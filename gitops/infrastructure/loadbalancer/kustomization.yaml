@@ -13,9 +13,7 @@ kind: Kustomization
 # selectors ambiguous, and Crossplane resolves the FIRST match rather than failing, so the
 # symptom would be a listener quietly attached to the wrong ALB.
 resources:
-  - alb.yaml
-  - target-group.yaml
-  - listener.yaml
+  - alb-web.yaml
   - alb-argocd.yaml
   - alb-signoz.yaml
   - alb-jenkins.yaml
