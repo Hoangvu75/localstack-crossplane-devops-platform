@@ -302,3 +302,61 @@ and no build ran. Nothing was broken; the filter did precisely what it says.
 
 GitHub's own webhook sends the full message too, so this is not an artifact of polling —
 name the marker `[skip` + `ci]`, or say "the skip marker", when writing about it.
+
+## 12. A Jenkins agent is several containers that disagree about who they are
+
+A Tekton Task is one pod, one container per step, one user. A Jenkins agent pod is a
+`jnlp` container plus whatever the `podTemplate` declares, and `checkout scm` runs in one
+of them while `container('tools') { sh ... }` runs in another. They share the workspace
+volume and nothing else — not the UID, not `$HOME`, not the git config.
+
+Build #3 pushed all six images and then died on the first line of the write-back stage:
+
+```
++ git config user.email jenkins-ci@localstack-crossplane.internal
+fatal: not in a git directory
+```
+
+The workspace *is* a git repository. `checkout scm` ran in `jnlp` as uid 1000 and owns the
+`.git` it created; the write-back runs in `alpine/k8s`, which is root. Git refuses to
+operate on a repository owned by another user, and a `git config` with no `--global` has
+nowhere to write but `.git/config` — so it reports the directory as not a repository at
+all, rather than as one it declines to touch. The message names the wrong problem.
+
+Two things fix it together, and one alone is not enough:
+
+```sh
+git config --global --add safe.directory "$(pwd)"   # or `git add` fails one line later
+git config --global user.email ...                  # --global: root can write $HOME
+```
+
+The general rule: **anything in a Jenkinsfile that writes to the workspace has to assume a
+different user created it.** Tekton hid this by construction, so a pipeline ported from it
+will pass every build stage and fail at the first stage that commits.
+
+## 13. Three failures in one migration that only appeared at runtime
+
+None of these were visible in review; all three were correct-looking configuration.
+
+**`configMapGenerator` without `namespace`.** kustomize appends a content hash to the
+generated ConfigMap and rewrites references to it — but it matches references by namespace
+*as well as* by name. A generator with no `namespace` lands in `default`, silently declines
+to rewrite the Deployment's volume reference, and `kustomize build` succeeds. The result
+would have been a controller mounting a ConfigMap that does not exist, stuck in
+ContainerCreating with no error naming the cause. Caught only by grepping the built output
+for the two names and noticing they differed.
+
+**CSRF crumb on every Jenkins POST.** `curl -u admin:pw -X POST .../build` returns 403.
+Jenkins requires a crumb, and the cookie it was issued against has to come back with it.
+Basic auth with a password does not bypass this; an API token would. `make run-ci` was
+written without it and would have failed the first time anyone ran it.
+
+**The skip marker matched in prose.** Documented as rule 11, and worth repeating here
+because it is the same shape: the commit that *introduced* the polling filter explained
+`[skip` `ci]` in its body, the filter read the whole message, and the build was skipped.
+Delivered, accepted, filtered, no run, nothing broken.
+
+The common thread is that each was checked against the documentation and not against a
+running system. The cost of finding out was one build cycle each, which is cheap — but
+only because there was a cycle to spend. Reading the built output, or POSTing once by
+hand, would have found all three before committing.
