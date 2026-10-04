@@ -146,3 +146,217 @@ upstream-resolution allowlist in `docker-compose.yml` that a new remote host wil
 To bump a version, download the new file next to the old one, change the reference in
 `kustomization.yaml`, and delete the old file in the same commit. Never hand-edit a
 vendored manifest.
+
+## 8. A PVC stuck in Terminating is almost never stuck
+
+`kubernetes.io/pvc-protection` blocks deletion while ANY pod still references the claim --
+including pods that finished hours ago. Tekton leaves a Completed pod behind for every
+TaskRun, so retiring a cache PVC leaves it Terminating until that pod goes.
+
+```bash
+# who is holding it
+kubectl -n tekton-ci get pods -o json | jq -r '.items[]
+  | select(.spec.volumes[]?.persistentVolumeClaim.claimName=="dind-cache")
+  | .metadata.name'
+
+kubectl -n tekton-ci delete pod <that-pod>     # the PVC disappears within seconds
+```
+
+**Never remove the finalizer by hand.** `kubectl patch pvc ... -p '{"metadata":{"finalizers":null}}'`
+makes the object vanish and orphans the PersistentVolume behind it, leaving the directory
+on the node forever with nothing referencing it. The finalizer is doing its job; find the
+pod instead.
+
+Related: every PipelineRun creates its own 2Gi workspace PVC from the volumeClaimTemplate
+in `ci/pipelinerun-manual.yaml`. Those live as long as the PipelineRun, so old runs are
+what to delete when the namespace accumulates claims:
+
+```bash
+kubectl -n tekton-ci get pipelinerun --sort-by=.metadata.creationTimestamp
+kubectl -n tekton-ci delete pipelinerun <old-run>   # takes its TaskRuns, pods and PVC with it
+```
+
+The six `dind-cache-*` claims are NOT in that category. They are declared in git, they are
+the reason a rebuild takes seconds instead of minutes, and deleting one only costs the next
+build its cache.
+
+## 9. `Synced` does not always mean applied
+
+The ApplicationSet sets `argocd.argoproj.io/compare-options: ServerSideDiff=true` on every
+Application. It is there for a real reason — Helm-rendered manifests emit empty fields that
+Kubernetes strips on write, and the default text diff never converges on them — but it has
+a failure mode worth knowing.
+
+ServerSideDiff runs a server-side apply **dry run** and compares the predicted result. Any
+mutating webhook in the path runs during that dry run, and ArgoCD then tries to subtract
+the webhook's changes back out. When it gets that subtraction wrong it can conclude there
+is no diff at all.
+
+Observed, twice, in different shapes:
+
+- `Deployment/tekton-pipelines-remote-resolvers` produced
+  `ComparisonError: error reverting webhook removed fields ... associative list with keys
+  has an element that omits key field`, which blocked the sync outright. Visible, at least.
+- Adding `instrumentation.opentelemetry.io/inject-nodejs` to the web Deployment produced no
+  error at all. The Application reported **Synced at the correct commit**, `kubectl
+  kustomize` rendered the annotation correctly, and the live Deployment simply did not have
+  it. The OpenTelemetry operator's mutating webhook sits in that path for everything in
+  `devops-apps`.
+
+The second one is the dangerous shape: a change that is committed, pushed, rendered and
+reported green, and never applied.
+
+**How to tell.** Compare the rendered manifest with the live object rather than trusting
+the status column:
+
+```bash
+kubectl kustomize gitops/workloads/web | grep -A3 'template:'
+kubectl -n devops-apps get deploy web -o jsonpath='{.spec.template.metadata.annotations}'
+```
+
+**How to fix it now.** A refresh only recomputes the diff, so it changes nothing. Force an
+apply:
+
+```bash
+kubectl -n argocd patch application web --type merge \
+  -p '{"operation":{"initiatedBy":{"username":"admin"},"sync":{"revision":"HEAD","syncStrategy":{"apply":{"force":true}}}}}'
+```
+
+The annotation landed and the pod was rolled within twenty seconds.
+
+**Why it is not simply turned off.** ServerSideDiff is what keeps SigNoz, cert-manager and
+ingress-nginx from sitting OutOfSync forever. Disabling it globally trades a rare silent
+failure for a permanent noisy one. Narrowing it to the components that need it means an
+extra field in all 23 `config.yaml` files or a conditional in the ApplicationSet template —
+worth doing, but not worth doing untested on a live cluster.
+
+The sibling learn-opensible lab carries the same setting and the same latent trap. It never
+surfaced there because nothing in that repo ever added a pod annotation that a mutating
+webhook reacts to.
+
+## 10. A silent background task is worse than a crash
+
+`history-service` ran for 174 minutes as a pod that was `Running`, had `0` restarts,
+answered `/health` with 200, answered `/ready` with 503, consumed nothing, and logged two
+lines. ArgoCD counted 578 readiness failures against it. The container never restarted,
+because `livenessProbe` hits `/health`, and `/health` only reports that the HTTP server is
+alive — which it was.
+
+The cause was one missing assignment. `record_queue_transit()` read `start_ns` three times
+and never set it, so it raised `NameError` on the first message of every run. Reproduced by
+extracting the function from the live pod's `/app/main.py` and calling it once:
+
+```
+RESULT: raised NameError: name 'start_ns' is not defined
+```
+
+The missing line was a unit conversion, and its comment was still there, orphaned above a
+line that needs no conversion:
+
+```python
+    # Kafka is ms, OTel is ns
+    now_ns = time.time_ns()          # already ns
+```
+
+But the `NameError` was only the trigger. Three separate decisions turned a one-line bug
+into an invisible outage, and each is the real rule:
+
+**Telemetry must never sit in the data path unguarded.** `record_queue_transit()` exists
+only to *describe* the work. It was called outside the `try` that wrapped `json.loads`, so
+a failure to draw a span stopped the service from consuming. A dropped span is a gap in a
+graph; an exception there was a service that stopped working.
+
+**`asyncio.create_task()` without a done-callback discards the exception.** `main()` starts
+the consumer with `create_task(consume())` and never awaits it — correct, because the HTTP
+server must come up even when the broker is down. The cost is that nothing retrieves the
+task's exception, so the traceback went nowhere. Either await it, add
+`task.add_done_callback(...)`, or make the coroutine log its own failure. This one now
+catches, prints the traceback, and reconnects with backoff.
+
+**A readiness flag cleared in a `finally` is a one-way door.** `consume()` set
+`consumer_ready = True`, then its `finally` set it back to `False` on the way out — with no
+loop to set it again. Readiness reported the truth and nothing acted on it: liveness passed,
+so Kubernetes left the pod in place forever.
+
+**Probes must be able to disagree.** `/health` and `/ready` returning the same answer would
+have restarted the pod. They correctly returned different answers, and the result was a pod
+that Kubernetes was content to leave broken indefinitely. If the consumer is the service's
+reason to exist, its death belongs in the liveness signal, not only the readiness one.
+
+The identical missing assignment is in the learn-opensible lab, in a byte-identical
+`main.py`, behind byte-identical probes and OTel annotations. It was never noticed there
+for exactly the reasons above.
+
+## 11. Do not write the CI skip marker in prose
+
+The `[skip ci]` filter in `gitops/platform/tekton/ci/triggers.yaml` tests the whole commit
+message:
+
+```
+!body.head_commit.message.contains('[skip ci]')
+```
+
+The commit that added the git poller *explained* that filter in its body, and the string
+appeared at line 19 of the message. The push was delivered, accepted with `202`, filtered,
+and no build ran. Nothing was broken; the filter did precisely what it says.
+
+GitHub's own webhook sends the full message too, so this is not an artifact of polling —
+name the marker `[skip` + `ci]`, or say "the skip marker", when writing about it.
+
+## 12. A Jenkins agent is several containers that disagree about who they are
+
+A Tekton Task is one pod, one container per step, one user. A Jenkins agent pod is a
+`jnlp` container plus whatever the `podTemplate` declares, and `checkout scm` runs in one
+of them while `container('tools') { sh ... }` runs in another. They share the workspace
+volume and nothing else — not the UID, not `$HOME`, not the git config.
+
+Build #3 pushed all six images and then died on the first line of the write-back stage:
+
+```
++ git config user.email jenkins-ci@localstack-crossplane.internal
+fatal: not in a git directory
+```
+
+The workspace *is* a git repository. `checkout scm` ran in `jnlp` as uid 1000 and owns the
+`.git` it created; the write-back runs in `alpine/k8s`, which is root. Git refuses to
+operate on a repository owned by another user, and a `git config` with no `--global` has
+nowhere to write but `.git/config` — so it reports the directory as not a repository at
+all, rather than as one it declines to touch. The message names the wrong problem.
+
+Two things fix it together, and one alone is not enough:
+
+```sh
+git config --global --add safe.directory "$(pwd)"   # or `git add` fails one line later
+git config --global user.email ...                  # --global: root can write $HOME
+```
+
+The general rule: **anything in a Jenkinsfile that writes to the workspace has to assume a
+different user created it.** Tekton hid this by construction, so a pipeline ported from it
+will pass every build stage and fail at the first stage that commits.
+
+## 13. Three failures in one migration that only appeared at runtime
+
+None of these were visible in review; all three were correct-looking configuration.
+
+**`configMapGenerator` without `namespace`.** kustomize appends a content hash to the
+generated ConfigMap and rewrites references to it — but it matches references by namespace
+*as well as* by name. A generator with no `namespace` lands in `default`, silently declines
+to rewrite the Deployment's volume reference, and `kustomize build` succeeds. The result
+would have been a controller mounting a ConfigMap that does not exist, stuck in
+ContainerCreating with no error naming the cause. Caught only by grepping the built output
+for the two names and noticing they differed.
+
+**CSRF crumb on every Jenkins POST.** `curl -u admin:pw -X POST .../build` returns 403.
+Jenkins requires a crumb, and the cookie it was issued against has to come back with it.
+Basic auth with a password does not bypass this; an API token would. `make run-ci` was
+written without it and would have failed the first time anyone ran it.
+
+**The skip marker matched in prose.** Documented as rule 11, and worth repeating here
+because it is the same shape: the commit that *introduced* the polling filter explained
+`[skip` `ci]` in its body, the filter read the whole message, and the build was skipped.
+Delivered, accepted, filtered, no run, nothing broken.
+
+The common thread is that each was checked against the documentation and not against a
+running system. The cost of finding out was one build cycle each, which is cheap — but
+only because there was a cycle to spend. Reading the built output, or POSTing once by
+hand, would have found all three before committing.

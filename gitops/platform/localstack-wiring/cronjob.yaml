@@ -21,36 +21,57 @@ data:
     # camelCase the API server prunes them silently, and the only visible effect is S3
     # failing much later against a virtual-hosted URL. Asserted on every loop because
     # this is the failure that looks like anything except its cause.
-    TOGGLES=$(kubectl get providerconfig default -o json 2>/dev/null | grep -c 'skip_[a-z_]*": true' || true)
+    #
+    # The resource name is fully qualified, not the bare "providerconfig": once the
+    # providers are installed, both providerconfigs and providerconfigusages match that
+    # prefix and kubectl refuses with "error: you must specify only one resource". The
+    # count then comes back 0 and this assertion fires against a ProviderConfig that is
+    # completely correct.
+    TOGGLES=$(kubectl get providerconfigs.aws.upbound.io default -o json 2>/dev/null | grep -c 'skip_[a-z_]*": true' || true)
     if [ "${TOGGLES:-0}" -lt 4 ]; then
       echo "WARNING: providerconfig/default has ${TOGGLES:-0} skip_ toggles, expected 4."
       echo "         They were pruned by the API server. Check for camelCase field names"
       echo "         in gitops/infrastructure/provider/provider-config.yaml."
     fi
 
-    # ── 1. ALB target group membership ──────────────────────────────────────
+    # ── 1. ALB target group membership, one per console ─────────────────────
+    # Three load balancers, three NodePorts. Each pair is a CONTRACT between a target
+    # group in gitops/infrastructure/loadbalancer/ and a Service nodePort:
+    #
+    #   -tg-ip     :30080  ingress-nginx, the public application
+    #   -argocd-tg :30081  argocd-server-nodeport
+    #   -jenkins-tg:30082  jenkins-nodeport
+    #   -signoz-tg :30083  signoz-nodeport
+    #
+    # k3d gives the node a new container IP on every cluster recreation, which is why
+    # none of this can be written down as a manifest.
     NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || echo "")
-    TG_ARN=$(aws elbv2 describe-target-groups --names "${TG_NAME}" --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null || echo "")
-
-    if [ -z "${TG_ARN}" ] || [ "${TG_ARN}" = "None" ]; then
-      echo "target group ${TG_NAME} does not exist yet, Crossplane still reconciling"
-    elif [ -z "${NODE_IP}" ]; then
-      echo "WARNING: could not read the node InternalIP"
+    if [ -z "${NODE_IP}" ]; then
+      echo "WARNING: could not read the node InternalIP, skipping target registration"
     else
-      CURRENT=$(aws elbv2 describe-target-health --target-group-arn "${TG_ARN}" --query 'TargetHealthDescriptions[].Target.Id' --output text 2>/dev/null || echo "")
-      # Compared before writing so a converged cluster makes no write calls. Registering
-      # an already-registered target is harmless, but it makes the log useless for
-      # spotting the moment a node IP actually changed.
-      if echo " ${CURRENT} " | grep -Fq " ${NODE_IP} "; then
-        echo "target ${NODE_IP}:30080 already registered"
-      else
-        aws elbv2 register-targets --target-group-arn "${TG_ARN}" --targets "Id=${NODE_IP},Port=30080"
-        echo "registered ${NODE_IP}:30080 (previous: ${CURRENT:-none})"
-      fi
+      for PAIR in "${PROJECT}-tg-ip:30080" "${PROJECT}-argocd-tg:30081" "${PROJECT}-jenkins-tg:30082" "${PROJECT}-signoz-tg:30083"; do
+        TG_N="${PAIR%%:*}"
+        TG_P="${PAIR##*:}"
+        TG_ARN=$(aws elbv2 describe-target-groups --names "${TG_N}" --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null || echo "")
+        if [ -z "${TG_ARN}" ] || [ "${TG_ARN}" = "None" ]; then
+          echo "target group ${TG_N} does not exist yet, Crossplane still reconciling"
+          continue
+        fi
+        CURRENT=$(aws elbv2 describe-target-health --target-group-arn "${TG_ARN}" --query 'TargetHealthDescriptions[].Target.Id' --output text 2>/dev/null || echo "")
+        # Compared before writing so a converged cluster makes no write calls.
+        # Re-registering is harmless, but it makes the log useless for spotting the
+        # moment a node IP actually changed.
+        if echo " ${CURRENT} " | grep -Fq " ${NODE_IP} "; then
+          echo "${TG_N}: ${NODE_IP}:${TG_P} already registered"
+        else
+          aws elbv2 register-targets --target-group-arn "${TG_ARN}" --targets "Id=${NODE_IP},Port=${TG_P}"
+          echo "${TG_N}: registered ${NODE_IP}:${TG_P} (previous: ${CURRENT:-none})"
+        fi
+      done
     fi
 
     # ── 2. CloudFront origin and Route53 alias ──────────────────────────────
-    ALB_DNS=$(kubectl get lb.elbv2.aws.upbound.io "${ALB_MR}" -o jsonpath='{.status.atProvider.dnsName}' 2>/dev/null || echo "")
+    ALB_DNS=$(kubectl get lbs.v1beta1.elbv2.aws.upbound.io "${ALB_MR}" -o jsonpath='{.status.atProvider.dnsName}' 2>/dev/null || echo "")
 
     if [ -z "${ALB_DNS}" ]; then
       echo "ALB reports no dnsName in .status.atProvider yet, nothing to wire"
@@ -60,13 +81,31 @@ data:
 
     # LocalStack does not always report a canonical hosted zone id. The real us-east-1
     # value is the correct fallback and is inert locally either way.
-    ALB_ZONE=$(kubectl get lb.elbv2.aws.upbound.io "${ALB_MR}" -o jsonpath='{.status.atProvider.zoneId}' 2>/dev/null || echo "")
+    ALB_ZONE=$(kubectl get lbs.v1beta1.elbv2.aws.upbound.io "${ALB_MR}" -o jsonpath='{.status.atProvider.zoneId}' 2>/dev/null || echo "")
     ALB_ZONE="${ALB_ZONE:-Z35SXDOTRQ7X7K}"
 
-    CUR_ORIGIN=$(kubectl get distribution.cloudfront.aws.upbound.io "${CF_MR}" -o jsonpath='{.spec.forProvider.origin[0].domainName}' 2>/dev/null || echo "")
+    CUR_ORIGIN=$(kubectl get distributions.v1beta1.cloudfront.aws.upbound.io "${CF_MR}" -o jsonpath='{.spec.forProvider.origin[0].domainName}' 2>/dev/null || echo "")
     if [ "${CUR_ORIGIN}" = "${ALB_DNS}" ]; then
       echo "cloudfront origin already ${ALB_DNS}"
     else
+      # ── The API version here is load-bearing ────────────────────────────
+      # `kubectl patch distribution.cloudfront.aws.upbound.io` resolves to the PREFERRED
+      # version, which is v1beta2, while these manifests are written against v1beta1. The
+      # two are not shape-compatible: Upbound converted singleton lists to objects in
+      # v1beta2, so origin[].customOriginConfig is an array in v1beta1 and an object in
+      # v1beta2. The patch below is v1beta1-shaped and was rejected every two minutes:
+      #
+      #     spec.forProvider.origin[0].customOriginConfig: Invalid value: "array":
+      #       ... in body must be of type object: "array"
+      #
+      # Nothing else showed it. The Distribution stayed SYNCED=True READY=True with its
+      # origin still on the placeholder, so CloudFront existed and served nothing useful.
+      # Route53 Record.alias has the same v1beta1/v1beta2 split.
+      #
+      # Pinning the version, distributions.v1beta1.cloudfront.aws.upbound.io, is what makes
+      # kubectl validate against the same schema the manifest uses. Migrating the manifests
+      # to v1beta2 instead would also work, and means rewriting every nested list as an
+      # object.
       # A merge patch replaces a list wholesale, so the whole origin entry is restated.
       # httpPort stays 4566: LocalStack binds nothing on 80 and multiplexes every
       # emulated endpoint behind its gateway port.
@@ -75,27 +114,176 @@ data:
       # escaping inside a YAML block scalar inside a ConfigMap is three levels of quoting
       # and gets corrupted by the first tool that reformats the file.
       ORIGIN_PATCH=$(printf '{"spec":{"forProvider":{"origin":[{"domainName":"%s","originId":"alb-origin","customOriginConfig":[{"httpPort":4566,"httpsPort":443,"originProtocolPolicy":"http-only","originSslProtocols":["TLSv1.2"]}]}]}}}' "${ALB_DNS}")
-      kubectl patch distribution.cloudfront.aws.upbound.io "${CF_MR}" --type=merge -p "${ORIGIN_PATCH}"
+      kubectl patch distributions.v1beta1.cloudfront.aws.upbound.io "${CF_MR}" --type=merge -p "${ORIGIN_PATCH}"
       echo "patched cloudfront origin: ${CUR_ORIGIN:-unset} -> ${ALB_DNS}"
     fi
 
-    CUR_ALIAS=$(kubectl get record.route53.aws.upbound.io "${REC_MR}" -o jsonpath='{.spec.forProvider.alias[0].name}' 2>/dev/null || echo "")
+    CUR_ALIAS=$(kubectl get records.v1beta1.route53.aws.upbound.io "${REC_MR}" -o jsonpath='{.spec.forProvider.alias[0].name}' 2>/dev/null || echo "")
     if [ "${CUR_ALIAS}" = "${ALB_DNS}" ]; then
       echo "route53 alias already ${ALB_DNS}"
     else
       ALIAS_PATCH=$(printf '{"spec":{"forProvider":{"alias":[{"evaluateTargetHealth":false,"name":"%s","zoneId":"%s"}]}}}' "${ALB_DNS}" "${ALB_ZONE}")
-      kubectl patch record.route53.aws.upbound.io "${REC_MR}" --type=merge -p "${ALIAS_PATCH}"
+      kubectl patch records.v1beta1.route53.aws.upbound.io "${REC_MR}" --type=merge -p "${ALIAS_PATCH}"
       echo "patched route53 alias: ${CUR_ALIAS:-unset} -> ${ALB_DNS}"
     fi
 
+    # ── Adopting the ALB listeners, and the runaway this stops ──────────────
+    # Every LBListener in this repo was stuck in AsyncCreateFailure from the day the
+    # cluster was built, creating a duplicate listener roughly every 90 seconds. Measured
+    # before this loop existed:
+    #
+    #     learn-crossplane-alb          844 listeners
+    #     learn-crossplane-argocd-alb   855
+    #     learn-crossplane-signoz-alb   769
+    #     describe-listeners            5063ms   (this CronJob calls it every 2 minutes)
+    #
+    # The cause is two server-side-apply managers writing one field:
+    #
+    #     manager=argocd-controller                                   op=Apply
+    #     manager=managed.crossplane.io/api-simple-reference-resolver op=Apply
+    #
+    # defaultAction is an ATOMIC array, so an apply replaces the list instead of merging
+    # into it. Each manager drops what the other wrote, the CRD rejects the result, and
+    # the provider can never record the listener's ARN in crossplane.io/external-name.
+    #
+    # Why that is fatal for THIS resource and harmless for its siblings: an ELBv2 listener
+    # has no name. LB and LBTargetGroup both do, so when the same lost-response failure hit
+    # them they re-found their own resources by name on the next reconcile and recovered on
+    # their own -- observed, both of them, during the Jenkins migration. A listener can only
+    # be found by ARN, so a lost external-name is unrecoverable: Crossplane cannot ask AWS
+    # "where is mine?", concludes it does not exist, and creates another.
+    #
+    # Writing the ARN back is therefore the whole fix, and it is the same shape as the two
+    # patches above: a value that cannot exist in git, read off the live API and put where
+    # the controller expects it. Verified with a controlled comparison over six minutes:
+    #
+    #     jenkins-alb (annotated)   2 -> 2    +0
+    #     signoz-alb  (not yet)   837 -> 841  +4
+    #
+    # ── The runaway is a LocalStack artefact; the cause is not ─────────────
+    # An earlier version of this note blamed the 50-listeners-per-ALB quota, and that was
+    # wrong in a way worth correcting rather than deleting. The quota counts DISTINCT
+    # listeners, one per port. What actually happens on real AWS is stricter and faster:
+    # a second listener on a port already in use is refused outright with
+    # DuplicateListener, so the SECOND CreateListener fails, not the fifty-first.
+    #
+    # On AWS the bug therefore produces no duplicates at all -- it produces one loud,
+    # permanent error on a resource that never goes Ready. LocalStack does allow two
+    # listeners on the same port, and that leniency is the whole reason 855 accumulated in
+    # silence over 26 hours.
+    #
+    # So the EXPLOSION is a LocalStack artefact. The CAUSE -- two server-side-apply
+    # managers fighting over an atomic array -- travels to AWS unchanged, where it stops
+    # being a slow leak and becomes an obvious outage. See README section 6.
+    #
+    # `|| true` on the annotate: a listener that genuinely has not been created yet has no
+    # ARN, and this loop must not fail the CronJob over a resource that is simply not ready.
+    for LSN in "${PROJECT}-alb-listener:${PROJECT}-alb" \
+               "${PROJECT}-argocd-listener:${PROJECT}-argocd-alb" \
+               "${PROJECT}-jenkins-listener:${PROJECT}-jenkins-alb" \
+               "${PROJECT}-signoz-listener:${PROJECT}-signoz-alb"; do
+      LSN_MR="${LSN%%:*}"
+      LSN_LB="${LSN##*:}"
+      CUR_EN=$(kubectl get lblisteners.v1beta1.elbv2.aws.upbound.io "${LSN_MR}" \
+        -o jsonpath='{.metadata.annotations.crossplane\.io/external-name}' 2>/dev/null || echo "")
+      case "${CUR_EN}" in
+        arn:*) continue ;;   # already adopted, nothing to do
+      esac
+      LB_ARN=$(aws elbv2 describe-load-balancers --names "${LSN_LB}" \
+        --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null || echo "")
+      [ -z "${LB_ARN}" ] || [ "${LB_ARN}" = "None" ] && continue
+      # Listeners[0]: they are identical duplicates of one another, so any of them is the
+      # right answer. Adopting one stops the rest from being created.
+      LSN_ARN=$(aws elbv2 describe-listeners --load-balancer-arn "${LB_ARN}" \
+        --query 'Listeners[0].ListenerArn' --output text 2>/dev/null || echo "")
+      [ -z "${LSN_ARN}" ] || [ "${LSN_ARN}" = "None" ] && continue
+      kubectl annotate lblisteners.v1beta1.elbv2.aws.upbound.io "${LSN_MR}" \
+        crossplane.io/external-name="${LSN_ARN}" --overwrite >/dev/null 2>&1 || true
+      echo "adopted listener ${LSN_MR} -> ${LSN_ARN##*/}"
+    done
+
+    # ── Janitor: delete duplicate listeners, keep the ADOPTED one ───────────
+    # Defence in depth, not the fix. The adoption loop above is what stops new
+    # duplicates; this cleans up whatever was created before it ran, and would catch a
+    # regression if the adoption ever silently stopped working.
+    #
+    # ── Which one to keep, and why it is not "the first" ────────────────────
+    # It keeps the listener whose ARN is in crossplane.io/external-name, NOT
+    # Listeners[0]. Those are usually the same and occasionally are not, and deleting the
+    # adopted one would re-arm the exact bug this exists to contain: Crossplane would look
+    # for its listener, not find it, and start creating again every 90 seconds.
+    #
+    # If a listener has not been adopted yet, this loop skips the ALB entirely rather than
+    # guessing. The adoption loop runs first and will have annotated it by the next tick.
+    #
+    # ── Bounded by TIME, not by a count ─────────────────────────────────────
+    # The first version capped deletions at 200 per ALB. That was measured wrong: with
+    # hundreds of listeners the ELBv2 API slows to seconds per call, 200 deletions took
+    # longer than the whole job is allowed, and the run was killed at
+    # activeDeadlineSeconds: 300 having cleaned exactly one of the four ALBs:
+    #
+    #     listeners learn-crossplane-alb: 56 found, 55 pruned, keeping 710b6c93
+    #     <job killed, FailureTarget>
+    #
+    # A fixed count cannot be right, because how long a deletion takes depends on how many
+    # listeners are left -- the thing being fixed. A wall-clock budget is self-tuning: it
+    # prunes hard while the API is fast and backs off while it is slow, and it always
+    # leaves the job time to finish and report.
+    #
+    # 180s of the 300s deadline, leaving room for the target registration, CloudFront,
+    # Route53 and adoption work that runs before this. Draining a large backlog then takes
+    # several runs, which is correct for a background chore -- the count printed each run
+    # shows it converging.
+    PRUNE_BUDGET=180
+    PRUNE_START=$(date +%s)
+    for LSN in "${PROJECT}-alb-listener:${PROJECT}-alb" \
+               "${PROJECT}-argocd-listener:${PROJECT}-argocd-alb" \
+               "${PROJECT}-jenkins-listener:${PROJECT}-jenkins-alb" \
+               "${PROJECT}-signoz-listener:${PROJECT}-signoz-alb"; do
+      LSN_MR="${LSN%%:*}"
+      LSN_LB="${LSN##*:}"
+      KEEP=$(kubectl get lblisteners.v1beta1.elbv2.aws.upbound.io "${LSN_MR}" \
+        -o jsonpath='{.metadata.annotations.crossplane\.io/external-name}' 2>/dev/null || echo "")
+      case "${KEEP}" in
+        arn:*) ;;
+        *) continue ;;   # not adopted yet -- do not guess which one to keep
+      esac
+      LB_ARN=$(aws elbv2 describe-load-balancers --names "${LSN_LB}" \
+        --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null || echo "")
+      [ -z "${LB_ARN}" ] || [ "${LB_ARN}" = "None" ] && continue
+      ALL=$(aws elbv2 describe-listeners --load-balancer-arn "${LB_ARN}" \
+        --query 'Listeners[].ListenerArn' --output text 2>/dev/null | tr '\t' '\n' || echo "")
+      TOTAL=$(printf '%s\n' "${ALL}" | grep -c '^arn:' || true)
+      [ "${TOTAL:-0}" -le 1 ] && continue
+
+      DELETED=0
+      for ARN in ${ALL}; do
+        [ "${ARN}" = "${KEEP}" ] && continue
+        # Checked every iteration rather than once per ALB: a single delete can take
+        # seconds when the backlog is large, so a per-ALB check would overshoot.
+        [ $(( $(date +%s) - PRUNE_START )) -ge "${PRUNE_BUDGET}" ] && break
+        aws elbv2 delete-listener --listener-arn "${ARN}" >/dev/null 2>&1 && DELETED=$((DELETED + 1))
+      done
+      # Printed even when it deletes nothing, so a run that finds 1 is visible proof the
+      # adoption is holding rather than an absence of output that could mean anything.
+      echo "listeners ${LSN_LB}: ${TOTAL} found, ${DELETED} pruned, keeping ${KEEP##*/}"
+    done
+
     # Printed every loop so `make status`, which tails this log, always has the current
     # entry URLs without querying anything itself.
-    CF_DOMAIN=$(kubectl get distribution.cloudfront.aws.upbound.io "${CF_MR}" -o jsonpath='{.status.atProvider.domainName}' 2>/dev/null || echo "")
-    echo "ENDPOINT ALB        http://${ALB_DNS}:4566/"
+    CF_DOMAIN=$(kubectl get distributions.v1beta1.cloudfront.aws.upbound.io "${CF_MR}" -o jsonpath='{.status.atProvider.domainName}' 2>/dev/null || echo "")
+    echo "ENDPOINT App        http://${ALB_DNS}:4566/"
+    for PAIR in "argocd-alb:ArgoCD" "jenkins-alb:Jenkins" "signoz-alb:SigNoz"; do
+      LB_N="${PROJECT}-${PAIR%%:*}"
+      LB_LABEL="${PAIR##*:}"
+      D=$(aws elbv2 describe-load-balancers --names "${LB_N}" --query 'LoadBalancers[0].DNSName' --output text 2>/dev/null || echo "")
+      if [ -n "${D}" ] && [ "${D}" != "None" ]; then
+        echo "ENDPOINT ${LB_LABEL}     http://${D}:4566/"
+      fi
+    done
     if [ -n "${CF_DOMAIN}" ]; then
       echo "ENDPOINT CloudFront http://${CF_DOMAIN}:4566/"
     fi
-    echo "ENDPOINT Webhook    http://${ALB_DNS}:4566/tekton-webhook  (POST only)"
     echo "=== done ==="
 ---
 apiVersion: batch/v1

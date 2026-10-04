@@ -1,0 +1,105 @@
+# ── JENKINS_HOME, and the uncomfortable truth about it ───────────────────────
+# Tekton kept nothing: Pipelines and Tasks were manifests, and a PipelineRun was a
+# disposable object. Jenkins is not built that way. JENKINS_HOME holds job definitions,
+# build history, plugin state and the credential store, and the controller writes to it
+# constantly.
+#
+# That is the real cost of this migration, and no amount of JCasC removes it. JCasC
+# reasserts configuration at boot and on reload; between reloads, anything changed through
+# the UI is written here and silently diverges from git. The mitigation is discipline plus
+# `overwritePlugins` and a JCasC reload after every change to the ConfigMap -- not the
+# absence of a volume.
+#
+# It is kept on a PVC rather than an emptyDir so a controller restart does not lose the
+# build history. Losing job DEFINITIONS would not matter -- JCasC rebuilds those from git
+# on every boot, which is the entire point.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jenkins-home
+  namespace: jenkins
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 8Gi
+---
+# ── One Docker layer cache per service, carried over from Tekton unchanged ───
+# Two dockerd processes must never share one /var/lib/docker, and these builds run
+# concurrently, so a single shared claim would both serialise them and let the services
+# evict each other's layers. Separate claims are what let an unchanged service finish in
+# seconds instead of re-pulling its base image.
+#
+# Sizes are per-service because their bases are not comparable: disk-service pulls most of
+# a Maven repository, the Node and Python services do not.
+#
+# These are the same claims ci/dind-cache-pvcs.yaml created for Tekton, re-declared in the
+# jenkins namespace because a PVC cannot be mounted across namespaces. The Tekton copies
+# are deleted with the rest of that stack.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dind-cache-web
+  namespace: jenkins
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 15Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dind-cache-cpu-service
+  namespace: jenkins
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 15Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dind-cache-memory-service
+  namespace: jenkins
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 15Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dind-cache-disk-service
+  namespace: jenkins
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      # Larger than the rest: a Maven build downloads most of central on a cold cache.
+      storage: 20Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dind-cache-rest-service
+  namespace: jenkins
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 15Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dind-cache-history-service
+  namespace: jenkins
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 15Gi

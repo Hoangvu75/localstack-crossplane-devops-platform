@@ -1,0 +1,22 @@
+# ── Why PodSecurity is privileged here, and why that is not lazy ─────────────
+# Build agents run a Docker daemon in a sidecar (Docker-in-Docker), which needs
+# `privileged: true`. Under the `restricted` profile the agent pod is rejected outright,
+# with the failure surfacing as a build that hangs waiting for an executor rather than as
+# an admission error anyone would think to look for.
+#
+# Tekton hit this exact wall and answered it the same way, by moving builds into their own
+# namespace with the profile relaxed there and nowhere else. The controller could live
+# under `restricted`, but splitting it into a second namespace buys little: the agents are
+# the thing that needs the exemption, and they are scheduled BY the controller into the
+# namespace named in the JCasC cloud definition.
+#
+# What keeps this honest is that nothing else lives here. Application workloads are in
+# devops-apps, which stays restricted.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: jenkins
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged

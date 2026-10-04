@@ -116,6 +116,46 @@ if ! kubectl wait --for=condition=Ready nodes --all --timeout=300s >/dev/null; t
 fi
 echo "    nodes ready"
 
+# ── Without this, nothing the lab installs can ever be scheduled ────────────
+# LocalStack starts a single-node k3d cluster and leaves the k3s server carrying
+#     node-role.kubernetes.io/control-plane=true:NoSchedule
+# There is no second node, because nothing here calls `aws eks create-nodegroup`. So
+# every workload without a matching toleration is unschedulable forever. kube-system
+# pods (CoreDNS, metrics-server, local-path-provisioner) tolerate it and run, which
+# makes the cluster look perfectly healthy.
+#
+# The symptom is two layers away from the cause. `helm --wait` sits until its timeout
+# and then reports:
+#     Error: context deadline exceeded
+# naming neither the taint nor the pods. Only `kubectl -n crossplane-system describe
+# pod` says what actually happened:
+#     0/1 nodes are available: 1 node(s) had untolerated taint
+#     {node-role.kubernetes.io/control-plane: true}
+#
+# The sibling learn-opensible lab never hit this: it created an EKS nodegroup, so LocalStack
+# added untainted k3d agent containers and workloads landed there.
+#
+# Removing the taint is the right trade here rather than adding a nodegroup: a nodegroup
+# means two more containers on a box that already has to run SigNoz/ClickHouse, and
+# scheduling on the control plane is what every single-node local cluster does (kind,
+# minikube and plain k3d all do it by default). If you want the more AWS-shaped topology,
+# call `aws eks create-nodegroup` here instead and drop this.
+#
+# The trailing "-" is kubectl taint remove syntax. It errors when the taint is absent, so
+# this has to swallow failure to stay idempotent across re-runs.
+echo "    removing the control-plane NoSchedule taint (single-node cluster)"
+kubectl taint nodes --all node-role.kubernetes.io/control-plane- >/dev/null 2>&1 || true
+# Clusters older than k8s 1.24 spell it "master". Harmless when absent.
+kubectl taint nodes --all node-role.kubernetes.io/master- >/dev/null 2>&1 || true
+
+# Assert, because a silent failure here costs five minutes at the next helm --wait.
+REMAINING=$(kubectl get nodes -o jsonpath='{.items[*].spec.taints[*].key}' 2>/dev/null | tr ' ' '\n' | grep -c "node-role.kubernetes.io" || true)
+if [ "${REMAINING:-0}" -gt 0 ]; then
+  echo "ERROR: a node-role NoSchedule taint survived. Nothing will schedule." >&2
+  echo "       kubectl get nodes -o jsonpath='{.items[*].spec.taints}'" >&2
+  exit 1
+fi
+
 # ── 2. Crossplane ────────────────────────────────────────────────────────────
 echo ""
 echo ">>> [2/6] Crossplane ${CROSSPLANE_VERSION}"
@@ -157,13 +197,47 @@ kubectl apply -f gitops/infrastructure/provider/provider-aws.yaml >/dev/null
 # The old probe was wrong twice over: it ran AFTER the apply, and a provider pod reaching
 # Ready does not mean its CRDs are served. condition=Healthy on the Provider object is the
 # signal that the revision is active.
-echo "    waiting for Healthy (packages download from xpkg.upbound.io, 1-3 min)..."
-if ! kubectl wait --for=condition=Healthy provider.pkg.crossplane.io --all --timeout=600s >/dev/null; then
-  echo "ERROR: providers did not reach Healthy. Inspect with:" >&2
-  echo "  kubectl get providers.pkg.crossplane.io" >&2
-  echo "  kubectl describe provider.pkg.crossplane.io provider-family-aws" >&2
-  exit 1
-fi
+# ── Why this is a progress loop and not `kubectl wait` ──────────────────────
+# It was `kubectl wait --for=condition=Healthy provider --all --timeout=600s`, which is
+# both too short and silent. Measured on a cold cache: containerd pulls the eight
+# provider images (200-400 MB each) SERIALLY, one starting roughly every two minutes, so
+# the whole set needs 15-20 minutes. At 600s the run died with five of eight Healthy and
+#     timed out waiting for the condition on providers/provider-aws-ec2
+# while the node sat at 6% CPU and 28% memory. Nothing was wrong; the deadline was.
+#
+# The loop prints x/y as it goes, because ten minutes of no output is indistinguishable
+# from a hang and invites killing a healthy run. The failure message distinguishes "still
+# pulling" from "actually broken", since ContainerCreating means only that the pull has
+# not finished.
+#
+# ec2, iam and s3 are consistently last: they carry by far the most CRDs.
+echo "    waiting for Healthy. Eight images, 200-400 MB each, pulled serially by"
+echo "    containerd -- budget 15-20 minutes on a cold cache."
+PROV_DEADLINE=1800
+PROV_WAITED=0
+while true; do
+  PTOT=$(kubectl get providers.pkg.crossplane.io --no-headers 2>/dev/null | wc -l | tr -d ' ')
+  POK=$(kubectl get providers.pkg.crossplane.io --no-headers 2>/dev/null | awk '$2=="True" && $3=="True"' | wc -l | tr -d ' ')
+  if [ "${PTOT:-0}" -gt 0 ] && [ "$POK" = "$PTOT" ]; then
+    echo "    all ${PTOT} providers Healthy after ${PROV_WAITED}s"
+    break
+  fi
+  if [ "$PROV_WAITED" -ge "$PROV_DEADLINE" ]; then
+    echo "ERROR: ${POK}/${PTOT} providers Healthy after ${PROV_DEADLINE}s." >&2
+    kubectl get providers.pkg.crossplane.io >&2
+    echo "" >&2
+    echo "       This is not necessarily broken. Check whether images are still coming:" >&2
+    echo "         kubectl -n crossplane-system get pods" >&2
+    echo "       ContainerCreating means the pull is still running -- just re-run this" >&2
+    echo "       script, it is idempotent and picks up where this left off." >&2
+    echo "       A CrashLoopBackOff or ImagePullBackOff is the real failure:" >&2
+    echo "         kubectl -n crossplane-system describe pod -l pkg.crossplane.io/provider" >&2
+    exit 1
+  fi
+  echo "    ${POK}/${PTOT} Healthy (${PROV_WAITED}s elapsed)"
+  sleep 30
+  PROV_WAITED=$((PROV_WAITED + 30))
+done
 
 until kubectl get crd providerconfigs.aws.upbound.io >/dev/null 2>&1; do sleep 2; done
 kubectl wait --for=condition=Established crd/providerconfigs.aws.upbound.io --timeout=120s >/dev/null
@@ -172,7 +246,12 @@ kubectl apply -f gitops/infrastructure/provider/provider-config.yaml >/dev/null
 # The four LocalStack toggles are snake_case in the CRD. In camelCase they are pruned
 # silently and every S3 call then addresses a virtual-hosted URL. Assert, do not hope.
 # The localstack-wiring CronJob re-checks this on every loop.
-TOGGLES=$(kubectl get providerconfig default -o json | grep -c 'skip_[a-z_]*": true' || true)
+#
+# The resource name is fully qualified, not the bare "providerconfig": once the providers
+# are installed, both providerconfigs and providerconfigusages match that prefix and
+# kubectl refuses with "error: you must specify only one resource". The count then comes
+# back 0 and this assertion fires against a ProviderConfig that is completely correct.
+TOGGLES=$(kubectl get providerconfigs.aws.upbound.io default -o json | grep -c 'skip_[a-z_]*": true' || true)
 if [ "${TOGGLES}" -lt 4 ]; then
   echo "ERROR: expected 4 skip_ toggles on providerconfig/default, found ${TOGGLES}." >&2
   echo "       They were pruned by the API server. Check for camelCase field names in" >&2
@@ -189,6 +268,36 @@ kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f - >/
 kubectl apply -n argocd -f gitops/bootstrap/argocd/install-v2.13.2.yaml >/dev/null
 kubectl -n argocd wait --for=condition=Available deployment/argocd-server --timeout=300s >/dev/null
 echo "    server available"
+
+# ── The two files that used to sit here doing nothing ───────────────────────
+# gitops/bootstrap/argocd/server-params-cm.yaml and nodeport-svc.yaml were copied over
+# from the sibling lab but never applied by anything, so the ArgoCD UI had no route in
+# at all and port-forward was the only way to reach it.
+#
+# They have to be applied in this order and AFTER the install, because the install
+# manifest ships its own argocd-cmd-params-cm and would overwrite the override.
+#
+#   server-params-cm  sets server.insecure=true, which is what makes argocd-server
+#                     listen plain HTTP on 8080. Without it the NodePort below targets a
+#                     port that speaks TLS, and the ALB health check gets a protocol
+#                     error rather than a 200.
+#   nodeport-svc      exposes that port as NodePort 30081, which is a contract with the
+#                     target group in gitops/infrastructure/loadbalancer/alb-argocd.yaml.
+echo "    applying server.insecure and the NodePort service"
+kubectl apply -f gitops/bootstrap/argocd/server-params-cm.yaml >/dev/null
+# Excludes Tekton PipelineRun/TaskRun from ArgoCD entirely. Without it ArgoCD prunes
+# running builds about 45 seconds in, because they are created at runtime and are not in
+# git. See the file for the full story.
+kubectl apply -f gitops/bootstrap/argocd/resource-exclusions-cm.yaml >/dev/null
+kubectl apply -f gitops/bootstrap/argocd/nodeport-svc.yaml >/dev/null
+
+# argocd-server reads cmd-params only at startup, so the ConfigMap alone changes nothing
+# until the pod is replaced.
+kubectl -n argocd rollout restart deployment/argocd-server >/dev/null
+kubectl -n argocd rollout restart statefulset/argocd-application-controller >/dev/null
+kubectl -n argocd rollout status deployment/argocd-server --timeout=180s >/dev/null
+kubectl -n argocd rollout status statefulset/argocd-application-controller --timeout=180s >/dev/null
+echo "    server restarted with plain HTTP on NodePort 30081"
 
 # ── 5. The credential that connects CI to CD ─────────────────────────────────
 echo ""
@@ -211,18 +320,19 @@ TOKEN=$(aws_ secretsmanager get-secret-value --secret-id "$SECRET_NAME_GITHUB" \
 
 if [ -z "$TOKEN" ] || [ "$TOKEN" = "dummy_token_for_local_testing" ]; then
   echo "    WARNING: no usable token in Secrets Manager (${SECRET_NAME_GITHUB})." >&2
-  echo "             The Tekton git push step will fail with an explicit error until you" >&2
-  echo "             set GITHUB_TOKEN in .env and re-run: make secrets && make bootstrap" >&2
+  echo "             Jenkins cannot clone this private repo or push image tags without it," >&2
+  echo "             so the job will fail on checkout. Set GITHUB_TOKEN in .env and re-run:" >&2
+  echo "                 make secrets && make bootstrap" >&2
   echo "             Everything else works." >&2
 else
-  # The namespace does not exist yet, because ArgoCD creates it when it syncs the tekton
+  # The namespace does not exist yet, because ArgoCD creates it when it syncs the jenkins
   # Application, so create it here rather than depending on sync ordering.
-  kubectl create namespace tekton-pipelines --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  kubectl create namespace jenkins --dry-run=client -o yaml | kubectl apply -f - >/dev/null
   # dry-run piped to apply rather than create secret, so re-running rotates the value
   # instead of failing with AlreadyExists.
-  kubectl -n tekton-pipelines create secret generic git-credentials \
+  kubectl -n jenkins create secret generic git-credentials \
     --from-literal=token="$TOKEN" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-  echo "    created in tekton-pipelines (value not echoed)"
+  echo "    created in jenkins (value not echoed)"
 
   # ── ArgoCD repository credential ──────────────────────────────────────
   # Required whenever the repo is PRIVATE, which this one is. Without it the git files
@@ -245,6 +355,37 @@ else
   kubectl -n argocd label secret repo-${PROJECT_NAME} \
     argocd.argoproj.io/secret-type=repository --overwrite >/dev/null
   echo "    ArgoCD repository credential created for ${GITHUB_REPO_URL}"
+fi
+
+# ── Jenkins admin credentials ────────────────────────────────────────────────
+# Outside the token check on purpose: Jenkins must be able to start and be logged into
+# even when no GitHub token is configured. Without this Secret the controller crash-loops
+# on a missing secretKeyRef, which reads as "Jenkins is broken" rather than "a credential
+# is missing".
+#
+# ── Why it is generated here and not committed ───────────────────────────────
+# gitops/platform/jenkins/casc/jenkins.yaml interpolates ${JENKINS_ADMIN_PASSWORD} from
+# the controller's environment precisely so the password never enters git. Generating it
+# at bootstrap keeps that true without asking anyone to invent one.
+#
+# ── Why it is NOT rotated on re-run ──────────────────────────────────────────
+# Every other secret here is written with `dry-run | apply`, which deliberately rotates
+# the value. This one checks first: a bootstrap re-run is a routine thing, and silently
+# changing the password someone has already saved would turn a routine re-run into a
+# lockout with no error message anywhere.
+kubectl create namespace jenkins --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+if kubectl -n jenkins get secret jenkins-secrets >/dev/null 2>&1; then
+  echo "    jenkins-secrets already exists, left unchanged (re-run safe)"
+else
+  # openssl is present wherever the AWS CLI is; tr strips the characters that make a
+  # password annoying to paste out of a terminal.
+  JENKINS_PW=$(openssl rand -base64 24 | tr -d '/+=' | cut -c1-20)
+  kubectl -n jenkins create secret generic jenkins-secrets \
+    --from-literal=adminPassword="$JENKINS_PW" \
+    --from-literal=cascReloadToken="$(openssl rand -hex 16)" \
+    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  echo "    jenkins-secrets created — admin password: ${JENKINS_PW}"
+  echo "    (also recoverable later with: make verify)"
 fi
 
 # ── 6. Handover ──────────────────────────────────────────────────────────────

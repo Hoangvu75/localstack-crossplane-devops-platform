@@ -4,3 +4,20 @@ resources:
   - signoz-v0.139.0.yaml
   # Extra Service so the ALB can reach SigNoz — see the file itself.
   - nodeport-svc.yaml
+
+# ── Patches, because the vendored release is never hand-edited ───────────────
+# Same rule as every other upstream manifest in this repo: signoz-v0.139.0.yaml is
+# refreshed by re-downloading it, so anything edited in place is lost on the next bump.
+# Both patches exist for one reason -- neither ClickHouse nor Zookeeper shipped a memory
+# limit, so both sized themselves against the whole 15.5Gi node and together held 2626Mi.
+patches:
+  - path: patch-zookeeper-memory.yaml
+    target:
+      kind: StatefulSet
+      name: signoz-zookeeper
+  - path: patch-clickhouse-memory.yaml
+    target:
+      group: clickhouse.altinity.com
+      version: v1
+      kind: ClickHouseInstallation
+      name: signoz-clickhouse

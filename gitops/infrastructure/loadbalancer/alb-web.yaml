@@ -1,0 +1,117 @@
+# The public application ALB: load balancer, target group and listener together.
+#
+# This was three files -- alb.yaml, target-group.yaml, listener.yaml -- while the three
+# console ALBs were each a single file. That split was historical rather than meaningful:
+# this trio was written first, the consoles later and in the tidier shape. Splitting the
+# three objects of ONE load balancer across three files means a change to this ALB touches
+# three places and a reviewer has to hold the whole directory in their head to see one
+# load balancer.
+#
+# ── The resource names are NOT made consistent, and that is deliberate ───────
+# The consoles read <project>-argocd-alb / -argocd-tg / -argocd-listener. This one reads
+# <project>-alb / -tg / -alb-listener, and its AWS target group name is -tg-ip rather than
+# -tg. Renaming any of them would make Crossplane delete the live AWS resource and create
+# a replacement, which for the ALB means a new DNS name and a broken entry URL until
+# localstack-wiring re-points CloudFront and Route53. Cosmetic consistency is not worth an
+# outage, and the -tg-ip name is a CONTRACT with the registration loop in
+# gitops/platform/localstack-wiring/cronjob.yaml.
+#
+# ── Why this ALB has a target group the others do not need ───────────────────
+# It does not point at the application. It points at ingress-nginx, which is itself a
+# NodePort service on 30080, and the Ingress inside the cluster is what routes to
+# web-svc. The consoles skip that layer and target their own NodePort directly, because
+# each serves its UI from / and the host-less / here already belongs to the web app.
+#
+#     ALB app     -> node:30080 -> ingress-nginx -> Ingress "web" -> web-svc (ClusterIP)
+#     ALB argocd  -> node:30081 -> argocd-server-nodeport
+#
+# On real AWS this collapses: one ALB, host-based Ingress rules, every Service back to
+# ClusterIP, and three ALBs plus three target groups plus the registration loop deleted.
+# It cannot be done here because LocalStack's gateway routes by its own hostname patterns
+# and has no knowledge of an Ingress inside k3d -- README section 6.
+apiVersion: elbv2.aws.upbound.io/v1beta1
+kind: LB
+metadata:
+  name: learn-crossplane-alb
+  labels:
+    component: alb
+spec:
+  forProvider:
+    enableDeletionProtection: false
+    internal: false
+    loadBalancerType: application
+    name: learn-crossplane-alb
+    region: us-east-1
+    securityGroupSelector:
+      matchLabels:
+        role: alb-sg
+    # `subnetRefs`, NOT `subnetIdRefs`. A reference helper is named after the AWS field
+    # it fills, and on elbv2 LB that field is `subnets` (a plural list of ids), so the
+    # generated trio is subnets / subnetRefs / subnetSelector. `subnetIdRefs` is absent
+    # from the CRD, gets pruned in silence, and the LB then fails to create because an
+    # application load balancer requires at least two subnets.
+    #
+    # Do not "fix" RouteTableAssociation to match this: its AWS field really is
+    # `subnetId`, so `subnetIdRef` there is correct. The suffix follows the field name,
+    # not a house style.
+    subnetRefs:
+      - name: learn-crossplane-public-a
+      - name: learn-crossplane-public-b
+    tags:
+      Name: learn-crossplane-alb
+      Environment: dev
+---
+apiVersion: elbv2.aws.upbound.io/v1beta1
+kind: LBTargetGroup
+metadata:
+  name: learn-crossplane-tg
+  labels:
+    component: alb
+spec:
+  forProvider:
+    healthCheck:
+      - healthyThreshold: 3
+        interval: 30
+        matcher: 200-399
+        path: /healthz
+        protocol: HTTP
+        timeout: 5
+        unhealthyThreshold: 3
+    # -tg-ip, not -tg: a CONTRACT with the registration loop in
+    # gitops/platform/localstack-wiring/cronjob.yaml, which looks the group up by this
+    # AWS name. The Kubernetes object above is named -tg. Renaming either breaks the loop
+    # silently -- the group is simply "not found yet" and the log says Crossplane is still
+    # reconciling, forever.
+    name: learn-crossplane-tg-ip
+    # 30080 is ingress-nginx-controller's NodePort, not the web app's.
+    port: 30080
+    protocol: HTTP
+    region: us-east-1
+    targetType: ip
+    vpcIdSelector:
+      matchLabels:
+        environment: dev
+    tags:
+      Name: learn-crossplane-tg
+      Environment: dev
+---
+apiVersion: elbv2.aws.upbound.io/v1beta1
+kind: LBListener
+metadata:
+  name: learn-crossplane-alb-listener
+spec:
+  forProvider:
+    defaultAction:
+      - targetGroupArnSelector:
+          matchLabels:
+            component: alb
+        type: forward
+    loadBalancerArnSelector:
+      matchLabels:
+        component: alb
+    port: 80
+    protocol: HTTP
+    region: us-east-1
+    tags:
+      Name: learn-crossplane-listener
+      Environment: dev

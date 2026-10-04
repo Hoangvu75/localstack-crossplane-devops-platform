@@ -1,0 +1,38 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# ── No vendored upstream release here, unlike every other platform component ──
+# cert-manager, ingress-nginx, SigNoz and Tekton all vendor a rendered upstream manifest,
+# because each ships one. Jenkins ships a Helm chart instead, and rendering it would put
+# roughly 2000 lines of generated YAML in this repo to obtain a Deployment, a Service, a
+# PVC and RBAC that are shorter and far clearer written directly.
+#
+# The trade is real: no chart means no upstream defaults arriving on a version bump, so
+# anything Jenkins starts recommending has to be adopted by hand. For a controller whose
+# entire configuration is one JCasC file, that is the better side of the trade.
+resources:
+  - namespace.yaml
+  - rbac.yaml
+  - pvc.yaml
+  - deployment.yaml
+  - service.yaml
+
+# ── The hash suffix is the point, not an artefact ────────────────────────────
+# configMapGenerator appends a content hash to the ConfigMap name and rewrites every
+# reference to it, so editing casc/jenkins.yaml produces a NEW ConfigMap name and rolls
+# the Deployment.
+#
+# Declaring the ConfigMap as a plain resource instead would update it in place: the
+# kubelet refreshes the mounted file a minute or two later, and Jenkins carries on running
+# the OLD configuration until someone reloads it by hand. That is a silent divergence
+# between git and the cluster -- exactly what this whole arrangement exists to prevent.
+configMapGenerator:
+  - name: jenkins-casc
+    # Not optional, and its absence fails quietly. A generated ConfigMap with no namespace
+    # lands in "default", and kustomize matches name references by namespace as well as by
+    # name -- so it silently declines to rewrite the Deployment's volume reference. The
+    # build still succeeds, and the result is a controller mounting a ConfigMap that does
+    # not exist, stuck in ContainerCreating with no error naming the cause.
+    namespace: jenkins
+    files:
+      - jenkins.yaml=casc/jenkins.yaml

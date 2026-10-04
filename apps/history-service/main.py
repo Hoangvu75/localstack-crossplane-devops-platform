@@ -12,6 +12,7 @@ No OpenTelemetry code except record_queue_transit() below — see its docstring.
 
 import asyncio
 import json
+import traceback
 import os
 import signal
 import time
@@ -93,7 +94,15 @@ def record_queue_transit(msg: Any) -> None:
     if trace.get_current_span(ctx).get_span_context().trace_id == 0:
         return
 
-    # Kafka is ms, OTel is ns
+    # ── The line whose absence broke this service ───────────────────────
+    # msg.timestamp is Kafka milliseconds, OpenTelemetry wants nanoseconds. This
+    # assignment was missing: start_ns was read three times below and never set, so this
+    # function raised NameError on the FIRST message, every time. The caller did not
+    # wrap it, so the consume loop died, its finally cleared consumer_ready, and the task
+    # nobody awaited swallowed the traceback. Net effect: a pod that stayed Running with
+    # zero restarts, answered /health 200, answered /ready 503 forever, and consumed
+    # nothing -- consumer group Empty, /api/history count 0, two lines of log.
+    start_ns = msg.timestamp * 1_000_000
     now_ns = time.time_ns()
 
     # ── Clock skew ───────────────────────────────────────────────────────
@@ -141,46 +150,91 @@ async def consume() -> None:
     """Consume loop. Runs in the background for the lifetime of the process."""
     global consumer_ready
 
-    consumer = AIOKafkaConsumer(
-        TOPIC,
-        bootstrap_servers=KAFKA_BROKERS,
-        group_id=GROUP_ID,
-        client_id="history-service",
-        # latest: start reading from now, not from the beginning of the topic. Old snapshots
-        # have no value.
-        auto_offset_reset="latest",
-        enable_auto_commit=True,
-    )
-    await consumer.start()
-    consumer_ready = True
-    print(f"[history-service] listening on {TOPIC} at {KAFKA_BROKERS}", flush=True)
+    # ── Why this is a retry loop, and why every failure is printed ──────────
+    # This function used to run once. It connected, set consumer_ready, printed "listening
+    # on ...", and then the `async for` raised and the finally set consumer_ready back to
+    # False. Because main() starts it with asyncio.create_task() and never awaits the task,
+    # the exception was never retrieved and NOTHING was logged.
+    #
+    # The result was a pod that looks alive and does nothing: /health kept returning 200
+    # because the HTTP server was fine, /ready returned 503 forever, Kubernetes marked the
+    # pod NotReady and never restarted it because liveness passed. Observed as 578
+    # consecutive "Readiness probe failed: HTTP probe failed with statuscode: 503" events
+    # against a container with zero restarts and a two-line log.
+    attempt = 0
+    while True:
+        consumer = AIOKafkaConsumer(
+            TOPIC,
+            bootstrap_servers=KAFKA_BROKERS,
+            group_id=GROUP_ID,
+            client_id="history-service",
+            # latest: start reading from now, not from the beginning of the topic. Old
+            # snapshots have no value.
+            auto_offset_reset="latest",
+            enable_auto_commit=True,
+        )
+        try:
+            await consumer.start()
+            consumer_ready = True
+            attempt = 0
+            print(f"[history-service] listening on {TOPIC} at {KAFKA_BROKERS}", flush=True)
 
-    try:
-        async for msg in consumer:
-            # Called BEFORE parsing: the message crossed the queue whether or not the payload is valid.
-            record_queue_transit(msg)
+            async for msg in consumer:
+                # Called BEFORE parsing: the message crossed the queue whether or not the
+                # payload is valid.
+                #
+                # Wrapped, because this is the line that killed the loop -- it raised
+                # NameError on every message from a missing start_ns assignment. That one
+                # is fixed at the source now, but the wrapper stays: this call exists only
+                # to DESCRIBE the work, and telemetry must never break the path it is
+                # measuring. A dropped span is a gap in a graph; an unhandled exception
+                # here is a service that silently stops consuming.
+                try:
+                    record_queue_transit(msg)
+                except Exception as err:  # noqa: BLE001
+                    print(f"[history-service] span failed, continuing: {err!r}", flush=True)
 
+                try:
+                    payload = json.loads(msg.value.decode())
+                except Exception as err:  # noqa: BLE001
+                    # A bad message must not kill the loop, or it blocks the partition forever.
+                    print(f"[history-service] bad payload, skipping: {err}", flush=True)
+                    continue
+
+                history.append(
+                    {
+                        "receivedAt": datetime.now(timezone.utc).isoformat(),
+                        "source": (msg.key or b"?").decode(),
+                        "partition": msg.partition,
+                        "offset": msg.offset,
+                        "service": payload.get("service"),
+                        "language": payload.get("language"),
+                        "summary": payload.get("summary"),
+                    }
+                )
+
+        except asyncio.CancelledError:
+            # Shutdown, not a failure. Let it propagate so the process can exit.
+            raise
+        except Exception as err:  # noqa: BLE001
+            # The whole point of the rewrite: say WHY the loop stopped. Previously this
+            # exception went into a task nobody awaited and vanished.
+            print(f"[history-service] consume loop died: {err!r}", flush=True)
+            traceback.print_exc()
+        finally:
+            consumer_ready = False
             try:
-                payload = json.loads(msg.value.decode())
-            except Exception as err:  # noqa: BLE001
-                # A bad message must not kill the loop, or it blocks the partition forever.
-                print(f"[history-service] bad payload, skipping: {err}", flush=True)
-                continue
+                await consumer.stop()
+            except Exception:  # noqa: BLE001
+                pass
 
-            history.append(
-                {
-                    "receivedAt": datetime.now(timezone.utc).isoformat(),
-                    "source": (msg.key or b"?").decode(),
-                    "partition": msg.partition,
-                    "offset": msg.offset,
-                    "service": payload.get("service"),
-                    "language": payload.get("language"),
-                    "summary": payload.get("summary"),
-                }
-            )
-    finally:
-        await consumer.stop()
-        consumer_ready = False
+        attempt += 1
+        delay = min(60, 2 ** min(attempt, 6))
+        print(
+            f"[history-service] reconnecting to Kafka in {delay}s (attempt {attempt})",
+            flush=True,
+        )
+        await asyncio.sleep(delay)
 
 
 async def health(_req: web.Request) -> web.Response:

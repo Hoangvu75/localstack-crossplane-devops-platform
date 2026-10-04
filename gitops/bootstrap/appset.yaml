@@ -10,7 +10,7 @@
 #       · loadbalancer                      24  otel-collector
 #   3   cdn-dns                             30  _shared
 #   5   cert-manager                        35  each service
-#   8   tekton
+#   8   jenkins
 #
 # ── Read this before trusting those waves ────────────────────────────────────
 # `argocd.argoproj.io/sync-wave` on an Application only orders anything when a PARENT
@@ -92,6 +92,62 @@ spec:
         # writes the git placeholders straight back, so CloudFront would flap between a
         # working origin and placeholder.elb.localhost.localstack.cloud forever. That is
         # far more confusing than a plain failure.
+        # ── Fields Crossplane writes back into spec, which git will never contain ──
+        # A *Selector is an INPUT. Crossplane resolves it, then persists BOTH the *Ref it
+        # picked and the concrete ARN into spec.forProvider. Git only ever has the
+        # selector, so live and desired differ permanently and the Application sits
+        # OutOfSync forever while being completely correct.
+        #
+        # Only LBListener needs this. Every other kind here uses the same selector pattern
+        # and stays Synced, because ServerSideDiff reconciles a top-level resolved field on
+        # its own. What it cannot handle is the resolved value nested inside an ARRAY --
+        # defaultAction[].targetGroupArn -- which is exactly what LBListener has.
+        #
+        # Do not widen this to the selectors themselves. Those come from git and must keep
+        # being diffed; changing a selector should still show up as drift.
+        #
+        # ── managedFieldsManagers, and the 850 listeners that made it necessary ──
+        # The jqPathExpressions above stop the Application showing OutOfSync. They do NOT
+        # stop the two controllers fighting over the field, and that fight had been
+        # silently costing something much larger.
+        #
+        # Both ArgoCD and Crossplane's reference resolver write spec.forProvider with
+        # server-side apply:
+        #
+        #     manager=argocd-controller                                  op=Apply
+        #     manager=managed.crossplane.io/api-simple-reference-resolver op=Apply
+        #
+        # defaultAction is an ATOMIC array, so an apply replaces the whole list rather than
+        # merging into it. Each manager's apply drops what the other put there, the CRD's
+        # own validation rejects the result, and the provider can never record the
+        # listener's ARN:
+        #
+        #     cannot patch the managed resource via server-side apply: LBListener ... is
+        #     invalid: spec: Invalid value: "object": spec.forProvider.defaultAction is a
+        #     required parameter
+        #
+        # Without an external-name the provider concludes the listener does not exist and
+        # creates it again -- on every reconcile, for 23 hours. Measured before this fix:
+        #
+        #     learn-crossplane-argocd-alb   850 listeners
+        #     learn-crossplane-signoz-alb   760 listeners
+        #     describe-listeners            5063ms   (localstack-wiring calls it every 2m)
+        #
+        # Nothing was visibly broken -- the ALBs route through any matching listener, so
+        # every UI worked the whole time. The only symptoms were an Application stuck
+        # Creating and an ELBv2 API getting slower by one listener a minute.
+        #
+        # managedFieldsManagers tells ArgoCD to leave fields owned by that manager alone,
+        # which ends the fight at its cause rather than hiding the diff it produces.
+        - group: elbv2.aws.upbound.io
+          kind: LBListener
+          managedFieldsManagers:
+            - managed.crossplane.io/api-simple-reference-resolver
+          jqPathExpressions:
+            - .spec.forProvider.loadBalancerArn
+            - .spec.forProvider.loadBalancerArnRef
+            - .spec.forProvider.defaultAction[]?.targetGroupArn
+            - .spec.forProvider.defaultAction[]?.targetGroupArnRef
         - group: cloudfront.aws.upbound.io
           kind: Distribution
           jqPathExpressions:

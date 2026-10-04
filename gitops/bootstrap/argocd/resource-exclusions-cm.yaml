@@ -1,0 +1,48 @@
+# ArgoCD settings that have to exist before the ApplicationSet runs.
+#
+# ── The failure this file was created for, and why the fix is now gone ──────
+# It carried one exclusion, for tekton.dev PipelineRun and TaskRun. Those objects were
+# created at RUNTIME -- by a webhook, by the TriggerTemplate, by `kubectl create` -- and
+# were never in git. ArgoCD pruned them mid-build, roughly 45 seconds in, leaving only a
+# line in the application-controller log:
+#
+#     Adding resource result, status: 'Pruned', phase: 'Succeeded', message: 'pruned'
+#       application=argocd/platform-tekton kind=PipelineRun name=manual-monorepo-ci-run-...
+#
+# Tekton is gone, so the exclusion is dead and has been removed rather than left as
+# decoration for a CRD that is no longer installed.
+#
+# ── The same question, asked of Jenkins ─────────────────────────────────────
+# Jenkins has runtime-created objects too: every build spawns agent Pods in the `jenkins`
+# namespace, which platform-jenkins manages and syncs with prune: true. The shape of the
+# hazard is identical, and it would present the same way -- builds dying part-way with the
+# reason visible only in ArgoCD's log.
+#
+# It has not been reproduced. Agent pods survived a full build without being touched, and
+# the reason to expect that is how ArgoCD decides what to prune: it prunes resources
+# carrying its tracking label (app.kubernetes.io/instance), which it applies itself. Pods
+# created by the Jenkins controller carry `jenkins=slave` and no ArgoCD label, so they are
+# ORPHANED rather than tracked -- reported in the UI, never deleted.
+#
+# No exclusion is added pre-emptively, because the only one that would help is a
+# cluster-wide exclusion of Pod, and blinding ArgoCD to every Pod in the cluster to guard
+# against a failure that has not happened is a far worse trade than the failure.
+#
+# If a build ever does vanish mid-flight, this is the first place to look, and the fix is
+# NOT an exclusion: it is to move the agents into a namespace ArgoCD does not manage, by
+# changing `namespace` in the kubernetes cloud in
+# gitops/platform/jenkins/casc/jenkins.yaml and pointing the Role/RoleBinding there.
+#
+# ── Why this ConfigMap still exists ─────────────────────────────────────────
+# argocd-cm ships with an empty data block, and `kubectl apply` replaces data wholesale.
+# Any future ArgoCD setting belongs in THIS file rather than in a second ConfigMap of the
+# same name, which would silently overwrite whatever the first one set.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-cm
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: argocd-cm
+    app.kubernetes.io/part-of: argocd
+data: {}

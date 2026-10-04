@@ -1,0 +1,91 @@
+# Dedicated ALB for Jenkins, same reasoning as alb-argocd.yaml and alb-signoz.yaml: it
+# serves its UI and assets from / and should not share an ingress with the public
+# application.
+#
+# This replaces alb-tekton.yaml. The three AWS objects are renamed rather than reused,
+# which means Crossplane deletes the Tekton trio and creates these -- an ALB, a target
+# group and a listener are cheap here, and a target group called "tekton-tg" pointing at
+# Jenkins would be a lie that outlives everyone who remembers why.
+apiVersion: elbv2.aws.upbound.io/v1beta1
+kind: LB
+metadata:
+  name: learn-crossplane-jenkins-alb
+  labels:
+    component: alb-jenkins
+spec:
+  forProvider:
+    enableDeletionProtection: false
+    internal: false
+    loadBalancerType: application
+    name: learn-crossplane-jenkins-alb
+    region: us-east-1
+    securityGroupSelector:
+      matchLabels:
+        role: alb-sg
+    subnetRefs:
+      - name: learn-crossplane-public-a
+      - name: learn-crossplane-public-b
+    tags:
+      Name: learn-crossplane-jenkins-alb
+      Environment: dev
+      Component: ci
+---
+apiVersion: elbv2.aws.upbound.io/v1beta1
+kind: LBTargetGroup
+metadata:
+  name: learn-crossplane-jenkins-tg
+  labels:
+    component: alb-jenkins
+spec:
+  forProvider:
+    # ── /login, and why not / ────────────────────────────────────────────────
+    # Jenkins answers / with a 403 when anonymous read is disabled, which it is in
+    # casc/jenkins.yaml -- so a health check on / marks a perfectly healthy controller
+    # unhealthy. /login returns 200 to an unauthenticated request and is served by the
+    # same web tier, which is exactly what a health check should test.
+    #
+    # The Tekton target group used /readiness for the same reason: the SPA shell at / came
+    # back 200 even when the backend was broken.
+    healthCheck:
+      - healthyThreshold: 2
+        interval: 30
+        matcher: "200"
+        path: /login
+        protocol: HTTP
+        timeout: 5
+        unhealthyThreshold: 3
+    name: learn-crossplane-jenkins-tg
+    # 30082 is a CONTRACT with the nodePort in gitops/platform/jenkins/service.yaml, and
+    # with the registration loop in gitops/platform/localstack-wiring/cronjob.yaml.
+    # Inherited from the Tekton Dashboard, which held this slot.
+    port: 30082
+    protocol: HTTP
+    region: us-east-1
+    targetType: ip
+    vpcIdSelector:
+      matchLabels:
+        environment: dev
+    tags:
+      Name: learn-crossplane-jenkins-tg
+      Environment: dev
+---
+apiVersion: elbv2.aws.upbound.io/v1beta1
+kind: LBListener
+metadata:
+  name: learn-crossplane-jenkins-listener
+spec:
+  forProvider:
+    defaultAction:
+      - targetGroupArnSelector:
+          matchLabels:
+            component: alb-jenkins
+        type: forward
+    loadBalancerArnSelector:
+      matchLabels:
+        component: alb-jenkins
+    port: 80
+    protocol: HTTP
+    region: us-east-1
+    tags:
+      Name: learn-crossplane-jenkins-listener
+      Environment: dev

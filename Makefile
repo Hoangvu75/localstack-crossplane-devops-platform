@@ -4,7 +4,26 @@
 # `status` and `run-ci` used to be shell scripts. They are plain kubectl sequences with no
 # logic worth putting in a file, and keeping them here makes the whole surface of the
 # project visible in one screen.
-.PHONY: all up secrets bootstrap status run-ci destroy purge
+# ── Why these are exported ───────────────────────────────────────────────────
+# aws eks update-kubeconfig writes an exec credential plugin:
+#     command: aws
+#     args:    [--region, us-east-1, eks, get-token, --cluster-name, ...]
+#     env:     null
+# env: null means the plugin inherits the shell environment, so EVERY kubectl call
+# needs AWS credentials present or it fails with something that names neither kubectl
+# nor the cluster:
+#     Unable to locate credentials. You can configure credentials by running "aws configure".
+#     Unable to connect to the server: getting credentials: exec: executable aws failed
+#
+# The scripts get these from .env via scripts/lib.sh. make runs each recipe in its own
+# shell and does not read .env, so status and run-ci need them here.
+#
+# ?= so a real AWS profile in the environment still wins.
+export AWS_ACCESS_KEY_ID ?= mock_access_key
+export AWS_SECRET_ACCESS_KEY ?= mock_secret_key
+export AWS_DEFAULT_REGION ?= us-east-1
+
+.PHONY: all up secrets bootstrap status verify run-ci destroy purge
 
 # secrets before bootstrap: step 5 of the bootstrap reads the token back out of Secrets
 # Manager to build the in-cluster git-credentials Secret.
@@ -41,18 +60,39 @@ status:
 	@echo "── Workloads ────────────────────────────────────────────────"
 	-@kubectl -n devops-apps get pods
 	@echo ""
-	@echo "── Tekton CI ────────────────────────────────────────────────"
-	-@kubectl -n tekton-pipelines get secret git-credentials
-	-@kubectl -n tekton-pipelines get pipelinerun
+	@echo "── Jenkins CI ───────────────────────────────────────────────"
+	-@kubectl -n jenkins get secret git-credentials jenkins-secrets
+	-@kubectl -n jenkins get pods
 	@echo ""
 	@echo "── Entry URLs, from the last localstack-wiring run ──────────"
 	-@kubectl -n localstack-wiring logs -l app=localstack-wiring --tail=20
 
-# Start the pipeline by hand. The manifest is the same one the TriggerTemplate renders,
-# so this exercises the real Pipeline but skips the interceptor chain — README §8.2 has
-# the curl that tests the interceptors too.
+# Endpoints, credentials, ALB target health, and where the current build is. Kept as a
+# script rather than inlined here because make is not installed on every machine that
+# runs this lab, and a diagnostic you cannot reach is worse than no diagnostic.
+verify:
+	@bash scripts/verify-web-access.sh
+
+# Start the pipeline by hand, without waiting for the two-minute poll.
+#
+# Jenkins needs no manifest for this: the job already exists, created by JCasC at boot.
+# The POST goes through the same job, the same Jenkinsfile and the same agent pods as a
+# polled run -- the only thing it skips is the SCM poll that would have noticed the
+# commit. Note that it therefore ALSO skips the [skip ci] check, which lives in the
+# polling path: this will happily rebuild a commit polling would have ignored.
+#
+# ── The crumb is not optional ────────────────────────────────────────────────
+# A plain authenticated POST returns 403. Jenkins requires a CSRF crumb on every
+# state-changing request, and the cookie the crumb was issued against has to come back
+# with it -- hence -c then -b on the same jar. Basic auth with a password does not bypass
+# this; only an API token would.
 run-ci:
-	@kubectl create -f gitops/platform/tekton/ci/pipelinerun-manual.yaml
+	@JPW=$$(kubectl -n jenkins get secret jenkins-secrets -o jsonpath="{.data.adminPassword}" | base64 -d); \
+	kubectl -n jenkins exec deploy/jenkins -c jenkins -- sh -c \
+	  "C=\$$(curl -s -c /tmp/jk -u 'admin:$$JPW' 'http://localhost:8080/crumbIssuer/api/xml?xpath=concat(//crumbRequestField,\":\",//crumb)'); \
+	   curl -s -b /tmp/jk -u 'admin:$$JPW' -H \"\$$C\" -X POST -o /dev/null \
+	     -w '  build queued: HTTP %{http_code}  (201 = accepted)\n' \
+	     http://localhost:8080/job/monorepo-ci/build"
 
 # Keeps ./data/localstack, so the next `make up` resumes from the persisted state.
 destroy:

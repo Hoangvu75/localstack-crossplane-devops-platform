@@ -1,0 +1,8 @@
+name: platform-jenkins
+namespace: jenkins
+manifestPath: gitops/platform/jenkins
+# Wave 8, the slot Tekton held. CI has no dependants inside the cluster -- nothing else
+# waits for it to be Healthy -- but it must come up after cert-manager (5) and before the
+# workloads it builds for.
+syncWave: "8"
+prune: "true"

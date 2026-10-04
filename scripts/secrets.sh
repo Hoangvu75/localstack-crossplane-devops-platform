@@ -4,7 +4,7 @@
 # Separate from bootstrap.sh because it is the one step you re-run on its own: rotating a
 # token should not mean re-waiting on a cluster that is already up.
 #
-#   .env  ->  Secrets Manager  ->  k8s Secret git-credentials  ->  Tekton
+#   .env  ->  Secrets Manager  ->  k8s Secret git-credentials  ->  Jenkins
 #    here        here                bootstrap.sh step 5
 #
 # .env is the only place a token is typed by hand, and it is gitignored. If the cluster is
@@ -46,11 +46,12 @@ echo ">>> Stored (value not echoed)."
 
 # Refresh the in-cluster copy if there is a cluster to refresh. Silently skipped on a first
 # run, when this script executes before bootstrap.sh has created anything.
-if command -v kubectl >/dev/null 2>&1 && kubectl get ns tekton-pipelines >/dev/null 2>&1; then
+if command -v kubectl >/dev/null 2>&1 && kubectl get ns jenkins >/dev/null 2>&1; then
   echo ">>> Cluster is up, refreshing the git-credentials Secret..."
-  kubectl -n tekton-pipelines create secret generic git-credentials \
+  kubectl -n jenkins create secret generic git-credentials \
     --from-literal=token="$GITHUB_TOKEN" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-  echo ">>> Refreshed. In-flight PipelineRuns keep the old value; new ones get this one."
+  echo ">>> Refreshed. Jenkins reads it at boot, so restart the controller to pick it up:"
+  echo "        kubectl -n jenkins rollout restart deployment/jenkins"
 else
   echo ">>> No cluster yet. bootstrap.sh will materialise the in-cluster Secret."
 fi

@@ -11,7 +11,11 @@ FROM node:20-alpine AS builder
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm ci
+# See apps/web/Dockerfile for why --no-audit --no-fund and the test -d check are here:
+# npm can exit 0 with an empty node_modules, and the failure then appears in the next
+# step instead of this one.
+RUN npm ci --no-audit --no-fund \
+ && test -d node_modules/typescript
 
 COPY tsconfig.json ./
 COPY src ./src

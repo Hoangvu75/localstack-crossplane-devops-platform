@@ -20,10 +20,10 @@ labels:
     app.kubernetes.io/part-of: learn-crossplane
 
 # ── Where CI hands over to CD ────────────────────────────────────────────────
-# The Tekton task `git-update-workloads` runs `kustomize edit set image` in THIS directory
+# The Jenkinsfile's final stage runs `kustomize edit set image` in THIS directory
 # and commits the result. One file per service, so two parallel builds never clobber each
 # other. Replaced CodeBuild, which could not self-trigger on a push. See README §8.1.
 images:
 - name: learn-crossplane-cpu-service
   newName: 000000000000.dkr.ecr.us-east-1.localhost.localstack.cloud:4566/learn-crossplane-cpu-service
-  newTag: d115a37
+  newTag: f064ad1

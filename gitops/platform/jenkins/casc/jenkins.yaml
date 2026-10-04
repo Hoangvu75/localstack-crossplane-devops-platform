@@ -1,0 +1,134 @@
+# ── This file is the answer to "can Jenkins be configured without the UI" ────
+# Everything a person would otherwise click through -- the security realm, the agent
+# cloud, the credential store, the job itself -- is declared here and reapplied on every
+# boot. The setup wizard is disabled in the Deployment, so there is no first-run screen to
+# click past and no state that begins life outside git.
+#
+# It is turned into a ConfigMap by configMapGenerator in ../kustomization.yaml, which
+# appends a content hash to the name. That hash is why editing this file rolls the
+# controller instead of leaving it running the previous configuration.
+#
+# ${VAR} is interpolated by JCasC from the controller's environment before the YAML is
+# parsed, which is how secrets stay out of this file. It also means a literal ${...} in
+# the Job DSL below would be eaten -- write ^${...} if one is ever needed.
+jenkins:
+  systemMessage: |
+    Configured entirely by JCasC from gitops/platform/jenkins/casc/jenkins.yaml.
+    Changes made in this UI are NOT persisted to git and are overwritten on reload.
+
+  # ── 0 executors on the controller, and mode EXCLUSIVE ───────────────────────
+  # A build running on the controller shares its JVM, its filesystem and its credentials
+  # with Jenkins itself. Every build here is a throwaway pod instead. EXCLUSIVE means a
+  # job only runs where it is explicitly told to, so a missing agent surfaces as a queued
+  # build rather than as a silent fallback onto the controller.
+  numExecutors: 0
+  mode: EXCLUSIVE
+
+  securityRealm:
+    local:
+      allowsSignup: false
+      users:
+        - id: admin
+          password: "${JENKINS_ADMIN_PASSWORD}"
+
+  authorizationStrategy:
+    loggedInUsersCanDoAnything:
+      allowAnonymousRead: false
+
+  clouds:
+    - kubernetes:
+        name: "k8s"
+        serverUrl: "https://kubernetes.default.svc"
+        namespace: "jenkins"
+        # How an agent finds its way home. The controller is not reachable on a public
+        # name here, so both of these are in-cluster DNS.
+        jenkinsUrl: "http://jenkins.jenkins.svc.cluster.local:8080"
+        jenkinsTunnel: "jenkins-agent.jenkins.svc.cluster.local:50000"
+        # ── THE throttle, and it is here for a measured reason ───────────────
+        # Tekton has no maxConcurrency, so its build concurrency had to be bounded
+        # indirectly through memory requests. Getting that number wrong cost a whole
+        # pipeline: four concurrent Docker-in-Docker daemons pulling base images through
+        # LocalStack's DNS and Docker Desktop's NAT could not complete their TLS
+        # handshakes, and all four builds failed together with
+        #
+        #     net/http: TLS handshake timeout
+        #
+        # while two running alone both succeeded. The binding constraint is the network,
+        # not memory. Jenkins can say so directly, which is a real advantage of this cloud
+        # model over expressing the same limit as a resource request.
+        containerCapStr: "2"
+        podRetention: "never"
+        connectTimeout: 60
+        readTimeout: 60
+        directConnection: false
+
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - usernamePassword:
+              scope: GLOBAL
+              id: "github-token"
+              username: "x-access-token"
+              password: "${GITHUB_TOKEN}"
+              description: "GitHub PAT: clones the repo and pushes image-tag commits back."
+
+unclassified:
+  location:
+    # Must match how the browser reaches Jenkins, or the links it renders point at
+    # localhost. This is the in-cluster name; the ALB address works too and is what a
+    # human uses.
+    url: "http://jenkins.jenkins.svc.cluster.local:8080/"
+
+# ── The job, defined as code rather than created by hand ──────────────────────
+# Job DSL runs at boot. The job it produces is disposable: delete it in the UI and the
+# next reload recreates it exactly.
+jobs:
+  - script: |
+      pipelineJob('monorepo-ci') {
+        description('Builds the six microservice images and writes the new tags back to git. Defined by JCasC -- edits in this UI are lost on reload.')
+        definition {
+          cpsScm {
+            scm {
+              git {
+                remote {
+                  url('https://github.com/Hoangvu75/localstack-crossplane-devops-platform.git')
+                  credentials('github-token')
+                }
+                branch('*/main')
+                extensions {
+                  // The loop-breaker, and the direct equivalent of the CEL filter in
+                  // Tekton's EventListener. The last stage of this pipeline pushes a
+                  // commit; without this, polling would see that commit and build again,
+                  // forever.
+                  //
+                  // (?s) so . matches newlines: the marker is matched against the WHOLE
+                  // message, exactly as GitHub's webhook payload would be. A commit that
+                  // merely discusses the marker in its body is therefore also skipped --
+                  // not a bug, but it has bitten this repo once. See PROJECT_RULES.md
+                  // rule 11.
+                  messageExclusion {
+                    excludedMessage('(?s).*\\[skip ci\\].*')
+                  }
+                }
+              }
+            }
+            scriptPath('Jenkinsfile')
+            // Full checkout, not lightweight: a lightweight checkout fetches only the
+            // Jenkinsfile, and this pipeline needs the working tree at load time.
+            lightweight(false)
+          }
+        }
+        triggers {
+          // ── Polling, and why it is not a workaround here ───────────────────
+          // The cluster is behind NAT: GitHub cannot open an inbound connection to it,
+          // which is why Tekton's EventListener sat healthy and unreached for nineteen
+          // hours and needed a hand-written CronJob to feed it. Jenkins ships this.
+          // H spreads the load rather than firing every job on :00.
+          scm('H/2 * * * *')
+        }
+        logRotator {
+          numToKeep(20)
+          artifactNumToKeep(5)
+        }
+      }

@@ -61,7 +61,7 @@ services:
       # Disable CSRF mitigation to allow frontend web apps to load static assets seamlessly
       - DISABLE_CORS_CHECKS=1
       # Force external CDN/Registry domains to resolve via real upstream DNS to avoid x509 cert issues
-      - DNS_NAME_PATTERNS_TO_RESOLVE_UPSTREAM=.*cloudfront\.net,.*\.pkg\.dev,.*registry\.k8s\.io,.*quay\.io,.*ghcr\.io,.*docker\.io,.*docker\.com,.*githubusercontent\.com,.*github\.com,.*\.azureedge\.net,.*blob\.core\.windows\.net
+      - DNS_NAME_PATTERNS_TO_RESOLVE_UPSTREAM=.*cloudfront\.net,.*gcr\.io,.*storage\.googleapis\.com,.*\.pkg\.dev,.*registry\.k8s\.io,.*quay\.io,.*ghcr\.io,.*docker\.io,.*docker\.com,.*githubusercontent\.com,.*github\.com,.*\.azureedge\.net,.*blob\.core\.windows\.net
     env_file:
       - .env
     volumes:

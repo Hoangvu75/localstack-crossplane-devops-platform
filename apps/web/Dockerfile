@@ -20,7 +20,16 @@ COPY package*.json ./
 # diverges from package.json. Builds are deterministic across runs.
 #
 # `--legacy-peer-deps` is used because npm 7+ treats peer dependency conflicts as hard errors.
-RUN npm ci --legacy-peer-deps
+# --no-audit --no-fund: the audit pass POSTs the whole dependency tree to the registry
+# and, on a Next.js tree inside DinD, was a large part of a 47-MINUTE npm ci.
+#
+# The `test -d` is not paranoia. npm 10.8.2 hit its own bug here:
+#     npm error Exit handler never called!
+# and then EXITED 0, leaving node_modules empty. Docker happily continued, and the
+# failure surfaced two steps later as `sh: next: not found` with exit 127 -- pointing at
+# the build script instead of the install. This makes the install fail where it broke.
+RUN npm ci --legacy-peer-deps --no-audit --no-fund \
+ && test -d node_modules/next
 
 COPY . .
 

@@ -1,0 +1,39 @@
+# ── JSON6902, not a strategic merge patch ────────────────────────────────────
+# ClickHouseInstallation is a CRD, and kustomize has no strategic-merge schema for it. A
+# merge patch on an unknown type falls back to JSON merge semantics, where patching a LIST
+# replaces the whole list -- which would silently delete the init container, the volumes
+# and every other container in the pod template. Explicit indices are uglier and safe.
+#
+# ── Why max_server_memory_usage is set explicitly instead of trusting the limit ──
+# ClickHouse was resident at 1889Mi against a `requests: 200Mi` and no limit at all --
+# 9.4x its request. It was not leaking. With no cgroup ceiling it applies
+# max_server_memory_usage_to_ram_ratio (0.9) to the whole node, decides it may use ~14Gi,
+# and sizes its mark cache and uncompressed cache to match.
+#
+# Modern ClickHouse does read a container memory limit and adjust -- but reliably only
+# under cgroup v2, and this node is cgroup v1:
+#
+#     $ stat -fc %T /sys/fs/cgroup
+#     tmpfs                          # cgroup2fs would mean v2
+#
+# (Same constraint that forced K3S_IMAGE_TAG to v1.31.14-k3s1 -- see docker-compose.yml.)
+# So a Kubernetes limit alone would not teach ClickHouse to restrain itself; it would just
+# arm the OOM killer. The server-side setting is what actually bounds it, and the limit
+# below is the backstop, set above it on purpose.
+- op: add
+  path: /spec/configuration/settings/max_server_memory_usage
+  value: "1200000000"
+
+# Sized for the workload this lab actually has: a few hundred MB of traces and logs,
+# queried by one browser tab. Raised from 200Mi so the scheduler sees something true.
+- op: replace
+  path: /spec/templates/podTemplates/0/spec/containers/0/resources/requests/memory
+  value: 900Mi
+
+# The backstop, ~330Mi above max_server_memory_usage to leave room for allocations
+# ClickHouse does not count against that budget (jemalloc arenas, thread stacks, the
+# HTTP/native protocol buffers).
+- op: add
+  path: /spec/templates/podTemplates/0/spec/containers/0/resources/limits
+  value:
+    memory: 1600Mi
